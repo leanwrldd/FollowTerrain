@@ -65,6 +65,10 @@ namespace TerrainBelts
 		// enough apart for it, and pipe steps bend at least this wide.
 		double MinBendRadius = 0.0;
 
+		// Level pipe supports over a flat surface keep their height instead of sagging down to
+		// GroundClearance between the supports.
+		bool bKeepLevelOnFlatGround = false;
+
 		// Never go below the vanilla spline, only over ground that pokes above it (rails: a
 		// straight grade is what you want, not one that dips into every hollow).
 		bool bOnlyRaise = false;
@@ -938,6 +942,45 @@ namespace TerrainBelts
 		return true;
 	}
 
+	bool ShouldKeepLevelOnFlatGround(const FGroundProfile& Profile)
+	{
+		constexpr double HeightTolerance = 2.0; // cm; allow foundation collision seams
+		constexpr double LevelSlopeTolerance = 0.001;
+		const double LevelZ = Profile.Points[0].Location.Z;
+		auto IsLevel = [](const FVector& Tangent)
+		{
+			return FMath::Abs(Tangent.Z) <= LevelSlopeTolerance * FVector2D(Tangent).Size();
+		};
+		if (FMath::Abs(Profile.Points.Last().Location.Z - LevelZ) > HeightTolerance ||
+			!IsLevel(Profile.Points[0].LeaveTangent) || !IsLevel(Profile.Points.Last().ArriveTangent) ||
+			Profile.Samples.IsEmpty())
+		{
+			return false;
+		}
+
+		// MinZ includes clearance, so don't flatten a route whose ground needs it to rise.
+		const double GroundLevel = Profile.MinZ[1];
+		auto IsFlat = [&](double Z)
+		{
+			return Z <= FMath::Min(LevelZ, Profile.Points.Last().Location.Z) && FMath::Abs(Z - GroundLevel) <= HeightTolerance;
+		};
+		for (int32 Index = 1; Index + 1 < Profile.MinZ.Num(); ++Index)
+		{
+			if (!IsFlat(Profile.MinZ[Index]))
+			{
+				return false;
+			}
+		}
+		for (const FGroundSample& Sample : Profile.Samples)
+		{
+			if (!IsFlat(Sample.MinZ))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
 	// Drapes local-space spline data over the ground below it. The ends never move, so snapping,
 	// poles and supports stay valid. Returns false if the spline was left alone.
 	bool DrapeSpline(TArray<FSplinePointData>& SplineData, const AActor* Hologram, const FDrapeSettings& Settings)
@@ -951,6 +994,14 @@ namespace TerrainBelts
 		}
 		TArray<double> MinZ = Profile.MinZ;
 		TArray<FGroundSample> Samples = Profile.Samples;
+		if (Settings.bKeepLevelOnFlatGround && ShouldKeepLevelOnFlatGround(Profile))
+		{
+			for (int32 Index = 1; Index + 1 < MinZ.Num(); ++Index)
+			{
+				MinZ[Index] = FMath::Lerp(Profile.Points[0].Location.Z, Profile.Points.Last().Location.Z,
+					Profile.Along[Index] / Profile.Along.Last());
+			}
+		}
 		if (Settings.bOnlyRaise)
 		{
 			for (int32 Index = 0; Index < MinZ.Num(); ++Index)
@@ -2204,7 +2255,8 @@ void FTerrainBeltsModule::RegisterHooks()
 				.GroundSampleSpacing = PipeGroundSampleSpacing,
 				.VerticalBendRadius = bHypertube ? HypertubeVerticalBendRadius : PipeVerticalBendRadius,
 				.bSmoothRoute = true,
-				.MinBendRadius = PipelineBendMargin * Hologram->mMinBendRadius});
+				.MinBendRadius = PipelineBendMargin * Hologram->mMinBendRadius,
+				.bKeepLevelOnFlatGround = true});
 
 			if (!Hologram->IsCurrentBuildMode(UTerrainBeltsBuildMode::StaticClass()))
 			{
