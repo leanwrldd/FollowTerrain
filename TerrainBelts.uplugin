@@ -1,0 +1,33 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"SemVersion": "1.0.0",
+	"GameVersion": ">=491125",
+	"FriendlyName": "Terrain Belts",
+	"Description": "Adds a Follow Terrain build mode to conveyor belts: drag a belt across a hill and it drapes over the ground instead of cutting straight through it.",
+	"Category": "Modding",
+	"CreatedBy": "leanwrldd",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "TerrainBelts",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "SML",
+			"Enabled": true,
+			"SemVersion": "^3.12.0"
+		}
+	]
+}
