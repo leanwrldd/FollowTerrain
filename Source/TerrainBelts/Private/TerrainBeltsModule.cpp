@@ -1,6 +1,7 @@
 #include "TerrainBeltsModule.h"
 
 #include "TerrainBeltsBuildMode.h"
+#include "TerrainBeltsConfig.h"
 #include "FGConstructDisqualifier.h"
 #include "FGFactoryConnectionComponent.h"
 #include "FGRecipe.h"
@@ -10,9 +11,15 @@
 #include "Buildables/FGBuildableConveyorBelt.h"
 #include "Buildables/FGBuildableConveyorLift.h"
 #include "Buildables/FGBuildablePipeHyper.h"
+#include "Buildables/FGBuildablePoleConveyor.h"
+#include "Buildables/FGBuildablePoleStackable.h"
 #include "Hologram/FGConveyorBeltHologram.h"
 #include "Hologram/FGConveyorLiftHologram.h"
+#include "Hologram/FGConveyorMultiPoleHologram.h"
+#include "Hologram/FGConveyorPoleHologram.h"
+#include "Hologram/FGFactoryBuildingHologram.h"
 #include "Hologram/FGPipelineHologram.h"
+#include "Hologram/FGPipelinePoleHologram.h"
 #include "Hologram/FGRailroadTrackHologram.h"
 #include "InstancedFoliageActor.h"
 #include "Patching/NativeHookManager.h"
@@ -65,13 +72,16 @@ namespace TerrainBelts
 		// enough apart for it, and pipe steps bend at least this wide.
 		double MinBendRadius = 0.0;
 
-		// Level pipe supports over a flat surface keep their height instead of sagging down to
+		// Level belt/pipe supports over a flat surface keep their height instead of sagging down to
 		// GroundClearance between the supports.
 		bool bKeepLevelOnFlatGround = false;
 
 		// Never go below the vanilla spline, only over ground that pokes above it (rails: a
 		// straight grade is what you want, not one that dips into every hollow).
 		bool bOnlyRaise = false;
+
+		// Belts must reject ground that cannot be reached from their fixed endpoints.
+		bool bEnforceIncline = false;
 	};
 
 	// Belts: incline comes from the hologram's mMaxIncline, minus this margin so draped slopes
@@ -87,7 +97,7 @@ namespace TerrainBelts
 	// Pipes have no incline limit, but a cap turns an elevated end into a ramp rather than a
 	// near-vertical drop. The spline runs through the pipe's centre.
 	constexpr double PipeStepLength = 400.0;
-	constexpr double PipeClearance = 60.0;
+	constexpr double PipeClearance = 60.0; // fallback if vanilla reports no hover height
 	constexpr double PipeMaxInclineDegrees = 60.0;
 	constexpr int32 PipeSmoothingPasses = 2;
 	constexpr double PipeHalfWidth = 50.0;
@@ -107,9 +117,8 @@ namespace TerrainBelts
 	// Smoothed pipe routes keep points at least this far apart (cm).
 	constexpr double MinRouteSpacing = 150.0;
 
-	// Where the ground rises or falls at least PipeStepMinRise (cm) in one stretch steeper than
-	// PipeStepMinSlopeDegrees, pipes take a vertical step there, like vanilla's horizontal-to-vertical
-	// mode, instead of a ramp. Gentler or lower slopes are draped as usual.
+	// Steep stretches tall enough for two elbows become steps. Trace headroom still covers
+	// metre-scale cliffs; shorter stairs are resolved with denser points in StepPipeSpline.
 	constexpr double PipeStepMinRise = 1000.0;
 	constexpr double PipeStepMinSlopeDegrees = 45.0;
 	// The step's two 90 degree bends have this radius (vanilla's 2D pipe bend radius is 199 cm).
@@ -262,6 +271,9 @@ namespace TerrainBelts
 		TArray<FSplinePointData> Draped;
 	};
 	TMap<FObjectKey, FRailSplines> RailSplines;
+
+	// Curvature alone does not make a pipe safe: the final fallback can run through a floor.
+	TSet<FObjectKey> PipelineGroundFailures;
 
 	// Holograms dropped while in Follow Terrain leave an entry behind.
 	constexpr int32 MaxRailSplinesBeforePrune = 32;
@@ -565,6 +577,7 @@ namespace TerrainBelts
 		TArray<FSplinePointData> Input;
 		double StepLength;
 		double ExtraTraceHeadroom;
+		double GroundClearance;
 		FGroundProfile Profile;
 	};
 	TMap<FObjectKey, TArray<FProfileCacheEntry>> ProfileCache;
@@ -578,7 +591,8 @@ namespace TerrainBelts
 		TArray<FProfileCacheEntry>& Entries = ProfileCache.FindOrAdd(FObjectKey(Hologram));
 		for (const FProfileCacheEntry& Entry : Entries)
 		{
-			if (Entry.StepLength == Settings.StepLength && Entry.ExtraTraceHeadroom == Settings.ExtraTraceHeadroom && SameSplineData(Entry.Input, WorldPoints))
+			if (Entry.StepLength == Settings.StepLength && Entry.ExtraTraceHeadroom == Settings.ExtraTraceHeadroom &&
+				Entry.GroundClearance == Settings.GroundClearance && SameSplineData(Entry.Input, WorldPoints))
 			{
 				Out = Entry.Profile;
 				return true;
@@ -599,7 +613,7 @@ namespace TerrainBelts
 		{
 			NewEntries.RemoveAt(0);
 		}
-		NewEntries.Add({WorldPoints, Settings.StepLength, Settings.ExtraTraceHeadroom, Out});
+		NewEntries.Add({WorldPoints, Settings.StepLength, Settings.ExtraTraceHeadroom, Settings.GroundClearance, Out});
 		return true;
 	}
 
@@ -813,6 +827,18 @@ namespace TerrainBelts
 		return Z;
 	}
 
+	// A pipe entering a flat floor must flatten before its low point. A centred difference can
+	// still point down there, pulling the Hermite curve below both points and into the floor.
+	double PipeDrapeSlope(double BeforeSlope, double AfterSlope, double CenteredSlope)
+	{
+		if (BeforeSlope * AfterSlope <= 0.0)
+		{
+			return 0.0;
+		}
+		const double Limit = 2.0 * FMath::Min(FMath::Abs(BeforeSlope), FMath::Abs(AfterSlope));
+		return FMath::Clamp(CenteredSlope, -Limit, Limit);
+	}
+
 	// Sets the heights and tangents of world-space points from MinZ (see SolveHeights). Then checks
 	// the actual curve against the ground samples between points and, where it dips into the
 	// ground, raises the points around it and solves again. The ends keep their location and tangents.
@@ -820,14 +846,65 @@ namespace TerrainBelts
 	bool FinishDrape(TArray<FSplinePointData>& Points, TArray<double> MinZ, const FDrapeSettings& Settings, const TArray<FGroundSample>& Samples = TArray<FGroundSample>())
 	{
 		const int32 Num = Points.Num();
+		if (Num < 2)
+		{
+			return false;
+		}
+		const double MaxSlope = FMath::Tan(FMath::DegreesToRadians(FMath::Clamp(Settings.MaxInclineDegrees, 0.0, 89.0)));
+		// Fixed ends can make the ground constraints impossible to satisfy. The height solver
+		// only raises interior points, so it cannot enforce the incline at a low fixed end.
+		// Reject those constraints before rounding or ground-sample correction can grow an arch.
+		TArray<double> Step;
+		TArray<double> Along;
+		ComputeSteps(Points, Step, Along);
+		constexpr double HeightTolerance = 2.0; // same tolerance as ground-sample correction
+		auto ReachableHeight = [&](double Distance)
+		{
+			return FMath::Min(Points[0].Location.Z + MaxSlope * Distance,
+				Points.Last().Location.Z + MaxSlope * (Along.Last() - Distance)) + HeightTolerance;
+		};
+		if (Settings.bEnforceIncline)
+		{
+			if (FMath::Abs(Points.Last().Location.Z - Points[0].Location.Z) > MaxSlope * Along.Last() + HeightTolerance)
+			{
+				if (FirstTime(TEXT("belt:unreachable-ends")))
+				{
+					UE_LOG(LogTerrainBelts, Display, TEXT("Belt drape rejected: endpoints %s -> %s need %.0f cm of rise over %.0f cm; maximum %.0f cm"),
+						*Points[0].Location.ToString(), *Points.Last().Location.ToString(),
+						FMath::Abs(Points.Last().Location.Z - Points[0].Location.Z), Along.Last(), MaxSlope * Along.Last());
+				}
+				return false;
+			}
+			for (int32 Index = 1; Index + 1 < Num; ++Index)
+			{
+				if (MinZ[Index] > ReachableHeight(Along[Index]))
+				{
+					if (FirstTime(TEXT("belt:unreachable-ground")))
+					{
+						UE_LOG(LogTerrainBelts, Display, TEXT("Belt drape rejected: ground at point %d needs Z %.0f, reachable Z %.0f; endpoints %s -> %s"),
+							Index, MinZ[Index], ReachableHeight(Along[Index]), *Points[0].Location.ToString(), *Points.Last().Location.ToString());
+					}
+					return false;
+				}
+			}
+			for (const FGroundSample& Sample : Samples)
+			{
+				if (Sample.MinZ > ReachableHeight(Along[Sample.Segment] + Sample.T * Step[Sample.Segment]))
+				{
+					if (FirstTime(TEXT("belt:unreachable-sample")))
+					{
+						UE_LOG(LogTerrainBelts, Display, TEXT("Belt drape rejected: ground sample on segment %d at %.2f needs Z %.0f, reachable Z %.0f; endpoints %s -> %s"),
+							Sample.Segment, Sample.T, Sample.MinZ, ReachableHeight(Along[Sample.Segment] + Sample.T * Step[Sample.Segment]),
+							*Points[0].Location.ToString(), *Points.Last().Location.ToString());
+					}
+					return false;
+				}
+			}
+		}
 		if (Num < 3)
 		{
 			return true;
 		}
-		TArray<double> Step;
-		TArray<double> Along;
-		ComputeSteps(Points, Step, Along);
-		const double MaxSlope = FMath::Tan(FMath::DegreesToRadians(FMath::Clamp(Settings.MaxInclineDegrees, 0.0, 89.0)));
 
 		MinZ[0] = Points[0].Location.Z;
 		MinZ[Num - 1] = Points.Last().Location.Z;
@@ -882,7 +959,12 @@ namespace TerrainBelts
 			{
 				FSplinePointData& Point = Points[Index];
 				Point.Location.Z = Z[Index];
-				const double Slope = (Z[Index + 1] - Z[Index - 1]) / (Step[Index - 1] + Step[Index]);
+				double Slope = (Z[Index + 1] - Z[Index - 1]) / (Step[Index - 1] + Step[Index]);
+				if (Settings.MinBendRadius > 0.0)
+				{
+					Slope = PipeDrapeSlope((Z[Index] - Z[Index - 1]) / Step[Index - 1],
+						(Z[Index + 1] - Z[Index]) / Step[Index], Slope);
+				}
 				const FVector Fallback = (Points[Index + 1].Location - Points[Index - 1].Location) * 0.5;
 				SetTangentSlope(Point.ArriveTangent, Slope, Fallback);
 				SetTangentSlope(Point.LeaveTangent, Slope, Fallback);
@@ -939,6 +1021,20 @@ namespace TerrainBelts
 			}
 			return false;
 		}
+		// Smoothing and sample correction can also leave an interior segment too steep.
+		for (int32 Index = 0; Settings.bEnforceIncline && Index + 1 < Num; ++Index)
+		{
+			if (FMath::Abs(Points[Index + 1].Location.Z - Points[Index].Location.Z) > MaxSlope * Step[Index] + HeightTolerance)
+			{
+				if (FirstTime(TEXT("belt:solved-too-steep")))
+				{
+					UE_LOG(LogTerrainBelts, Display, TEXT("Belt drape rejected: solved segment %d rises %.0f cm over %.0f cm; endpoints %s -> %s"),
+						Index, FMath::Abs(Points[Index + 1].Location.Z - Points[Index].Location.Z), Step[Index],
+						*Points[0].Location.ToString(), *Points.Last().Location.ToString());
+				}
+				return false;
+			}
+		}
 		return true;
 	}
 
@@ -981,6 +1077,50 @@ namespace TerrainBelts
 		return true;
 	}
 
+	// A lift beside a flat approach inherits its support height instead of pulling the belt
+	// down to ground clearance. On uneven ground the foot still follows the terrain.
+	double LiftFootHeight(const FGroundProfile& Profile, int32 Low, bool bUphill)
+	{
+		const double GroundZ = Profile.MinZ[Low];
+		const int32 End = bUphill ? 0 : Profile.Points.Num() - 1;
+		const double SupportZ = Profile.Points[End].Location.Z;
+		if (SupportZ <= GroundZ)
+		{
+			return GroundZ;
+		}
+		const int32 First = FMath::Min(Low, End);
+		const int32 Last = FMath::Max(Low, End);
+		for (int32 Index = First + 1; Index < Last; ++Index)
+		{
+			if (FMath::Abs(Profile.MinZ[Index] - GroundZ) > 2.0)
+			{
+				return GroundZ;
+			}
+		}
+		for (const FGroundSample& Sample : Profile.Samples)
+		{
+			if (Sample.Segment >= First && Sample.Segment < Last && FMath::Abs(Sample.MinZ - GroundZ) > 2.0)
+			{
+				return GroundZ;
+			}
+		}
+		return SupportZ;
+	}
+
+	double AutoLiftClearanceOffset(const FGroundProfile& Profile)
+	{
+		if (Profile.Points.Num() < 3)
+		{
+			return 0.0;
+		}
+		const int32 LastInterior = Profile.Points.Num() - 2;
+		// Measure on the flat approaches beside the original supports. Checking a later lift's
+		// whole approach crosses earlier cliffs and incorrectly loses this support clearance.
+		const double StartOffset = LiftFootHeight(Profile, 1, true) - Profile.MinZ[1];
+		const double EndOffset = LiftFootHeight(Profile, LastInterior, false) - Profile.MinZ[LastInterior];
+		return FMath::Max(StartOffset, EndOffset);
+	}
+
 	// Drapes local-space spline data over the ground below it. The ends never move, so snapping,
 	// poles and supports stay valid. Returns false if the spline was left alone.
 	bool DrapeSpline(TArray<FSplinePointData>& SplineData, const AActor* Hologram, const FDrapeSettings& Settings)
@@ -1021,6 +1161,86 @@ namespace TerrainBelts
 		}
 		SplineData = ToLocalPoints(Profile.Points, ToWorld);
 		return true;
+	}
+
+	// Sweep the pipe's volume along the final Hermite curve, including steps and the vanilla
+	// fallback. A downward ground trace cannot distinguish a solid floor from open space under it.
+	bool HasPipelineGroundClearance(const TArray<FSplinePointData>& SplineData, const AActor* Hologram, const FDrapeSettings& Settings)
+	{
+		const TArray<FSplinePointData> Points = ToWorldPoints(SplineData, Hologram->GetActorTransform());
+		const UWorld* World = Hologram->GetWorld();
+		if (Points.Num() < 2 || World == nullptr)
+		{
+			return false;
+		}
+		struct FCachedCheck
+		{
+			TArray<FSplinePointData> Points;
+			double Time;
+			bool bClear;
+		};
+		static TMap<FObjectKey, TArray<FCachedCheck>> Checks;
+		const FObjectKey Key(Hologram);
+		const double Now = World->GetRealTimeSeconds();
+		if (const TArray<FCachedCheck>* Cached = Checks.Find(Key))
+		{
+			for (const FCachedCheck& Check : *Cached)
+			{
+				// Refresh even an unchanged route so newly placed/dismantled foundations count.
+				if (Now - Check.Time < 0.25 && SameSplineData(Check.Points, Points))
+				{
+					return Check.bClear;
+				}
+			}
+		}
+		const FCollisionObjectQueryParams ObjectParams(ECC_WorldStatic);
+		const FCollisionShape Shape = FCollisionShape::MakeSphere(Settings.HalfWidth);
+		bool bClear = true;
+		for (int32 Segment = 0; bClear && Segment + 1 < Points.Num(); ++Segment)
+		{
+			const FSplinePointData& A = Points[Segment];
+			const FSplinePointData& B = Points[Segment + 1];
+			const double Span = FMath::Max3(FVector::Dist(A.Location, B.Location), A.LeaveTangent.Size(), B.ArriveTangent.Size());
+			const int32 Pieces = FMath::Max(2, FMath::CeilToInt(Span / 50.0));
+			FVector Previous = A.Location;
+			for (int32 Piece = 1; bClear && Piece <= Pieces; ++Piece)
+			{
+				const double T = static_cast<double>(Piece) / Pieces;
+				const FVector Location = FMath::CubicInterp(A.Location, A.LeaveTangent, B.Location, B.ArriveTangent, T);
+				FCollisionQueryParams Params(SCENE_QUERY_STAT(TerrainBeltsPipeClearance), false, Hologram);
+				for (int32 Attempt = 0; Attempt <= MaxSkippedHits; ++Attempt)
+				{
+					FHitResult Hit;
+					if (!World->SweepSingleByObjectType(Hit, Previous, Location, FQuat::Identity, ObjectParams, Shape, Params))
+					{
+						break;
+					}
+					if (!ShouldSkipGroundHit(Hit) || Attempt == MaxSkippedHits)
+					{
+						bClear = false;
+						if (FirstTime(TEXT("pipe:ground-obstruction")))
+						{
+							UE_LOG(LogTerrainBelts, Display, TEXT("Rejecting pipe curve intersecting %s at %s"),
+								*GetNameSafe(Hit.GetActor()), *Hit.ImpactPoint.ToString());
+						}
+						break;
+					}
+					Params.AddIgnoredActor(Hit.GetActor());
+				}
+				Previous = Location;
+			}
+		}
+		if (Checks.Num() >= MaxProfileCacheHolograms)
+		{
+			Checks.Reset();
+		}
+		TArray<FCachedCheck>& Entries = Checks.FindOrAdd(Key);
+		if (Entries.Num() >= MaxProfileCacheEntriesPerHologram)
+		{
+			Entries.RemoveAt(0);
+		}
+		Entries.Add({Points, Now, bClear});
+		return bClear;
 	}
 
 	// A stretch of ground steeper than the belt may climb.
@@ -1121,8 +1341,89 @@ namespace TerrainBelts
 		}
 	}
 
-	// Pipes: drapes like DrapeSpline, but where the ground rises or falls PipeStepMinRise or more in
-	// one steep stretch, the pipe takes a vertical step at the foot of it (flat - 90 degree bend -
+	// When the high side clears the ground at support height, keep its upper elbow there.
+	// Ground clearance alone would put the elbow below the connector and add an S-bend.
+	double PipeStepTopHeight(const FGroundProfile& Profile, const FCliff& Cliff, double DefaultTop)
+	{
+		const int32 High = Cliff.bUphill ? Cliff.RunEnd : Cliff.RunStart;
+		const int32 End = Cliff.bUphill ? Profile.Points.Num() - 1 : 0;
+		const double SupportZ = Profile.Points[End].Location.Z;
+		if (High == End)
+		{
+			return SupportZ;
+		}
+		const int32 First = FMath::Min(High, End);
+		const int32 Last = FMath::Max(High, End);
+		double LowestGround = UE_BIG_NUMBER;
+		double HighestGround = -UE_BIG_NUMBER;
+		for (int32 Index = First; Index <= Last; ++Index)
+		{
+			if (Index != End && Profile.MinZ[Index] > SupportZ)
+			{
+				return DefaultTop;
+			}
+			if (Index != End)
+			{
+				LowestGround = FMath::Min(LowestGround, Profile.MinZ[Index]);
+				HighestGround = FMath::Max(HighestGround, Profile.MinZ[Index]);
+			}
+		}
+		for (const FGroundSample& Sample : Profile.Samples)
+		{
+			if (Sample.Segment >= First && Sample.Segment < Last && Sample.MinZ > SupportZ)
+			{
+				return DefaultTop;
+			}
+			if (Sample.Segment >= First && Sample.Segment < Last)
+			{
+				LowestGround = FMath::Min(LowestGround, Sample.MinZ);
+				HighestGround = FMath::Max(HighestGround, Sample.MinZ);
+			}
+		}
+		// A separate terrace between this step and the support keeps its own height.
+		if (HighestGround - LowestGround >= 2.0 * PipeRiserBendRadius)
+		{
+			return DefaultTop;
+		}
+		return SupportZ;
+	}
+
+	// Direct height transition between horizontal connectors, with no intermediate crest or
+	// dip. The caller must check the actual curve's clearance before accepting it.
+	bool StraightenPipeRun(TArray<FSplinePointData>& Points)
+	{
+		if (Points.Num() < 2)
+		{
+			return false;
+		}
+		auto IsHorizontal = [](const FVector& Tangent)
+		{
+			return FMath::Abs(Tangent.Z) <= 0.001 * FVector2D(Tangent).Size();
+		};
+		if (!IsHorizontal(Points[0].LeaveTangent) || !IsHorizontal(Points.Last().ArriveTangent))
+		{
+			return false;
+		}
+		TArray<double> Step;
+		TArray<double> Along;
+		ComputeSteps(Points, Step, Along);
+		const double StartZ = Points[0].Location.Z;
+		const double EndZ = Points.Last().Location.Z;
+		const double Length = Along.Last();
+		for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
+		{
+			const double T = Along[Index] / Length;
+			Points[Index].Location.Z = FMath::CubicInterp(StartZ, 0.0, EndZ, 0.0, T);
+			const double Slope = 6.0 * (EndZ - StartZ) * T * (1.0 - T) / Length;
+			const FVector Fallback = (Points[Index + 1].Location - Points[Index - 1].Location) * 0.5;
+			SetTangentSlope(Points[Index].ArriveTangent, Slope, Fallback);
+			SetTangentSlope(Points[Index].LeaveTangent, Slope, Fallback);
+		}
+		return true;
+	}
+
+	// Pipes: drapes like DrapeSpline, but where a steep stretch fits two elbows, the pipe takes
+	// a vertical step at the foot of it (flat - 90 degree bend -
 	// straight up or down - 90 degree bend - flat), like vanilla's horizontal-to-vertical mode.
 	// Returns false when there is no such stretch (or no room for a step), so the caller drapes.
 	bool StepPipeSpline(TArray<FSplinePointData>& SplineData, const AActor* Hologram, const FDrapeSettings& Settings)
@@ -1130,6 +1431,8 @@ namespace TerrainBelts
 		const FTransform ToWorld = Hologram->GetActorTransform();
 		FDrapeSettings StepSettings = Settings;
 		StepSettings.ExtraTraceHeadroom = FMath::Max(Settings.ExtraTraceHeadroom, PipeStepMinRise * 2.0);
+		// Resolve individual stair faces instead of averaging several terraces into a ramp.
+		StepSettings.StepLength = FMath::Min(Settings.StepLength, 100.0);
 		FGroundProfile Profile;
 		if (!BuildProfile(ToWorldPoints(SplineData, ToWorld), Hologram, StepSettings, Profile))
 		{
@@ -1140,6 +1443,9 @@ namespace TerrainBelts
 		const double Length = Profile.Along[Num - 1];
 		const double Radius = FMath::Max(PipeRiserBendRadius, Settings.MinBendRadius);
 		const double Zone = Radius + PipeMinStraight; // from a step's centre to anything else
+		// A gap between platforms may expose terrain far below either support. A step should
+		// meet the lower support's level, not dive into that gap and immediately climb back out.
+		const double LowestEndZ = FMath::Min(Points[0].Location.Z, Points.Last().Location.Z);
 
 		// Every ground height known along the route, points and the checks between them, in order.
 		TArray<TPair<double, double>> Ground;
@@ -1160,11 +1466,13 @@ namespace TerrainBelts
 		TArray<double> StepAt;
 		TArray<double> FootZ;
 		TArray<double> TopZ;
-		for (const FCliff& Stretch : FindSteepStretches(Profile, FMath::Tan(FMath::DegreesToRadians(PipeStepMinSlopeDegrees)), PipeStepMinRise))
+		// Unlike belt auto-lifts, pipes also step down from elevated supports/platforms. A cliff
+		// beside an end can occupy the very first/last profile segment, even for a 16 m drop.
+		for (const FCliff& Stretch : FindSteepStretches(Profile, FMath::Tan(FMath::DegreesToRadians(PipeStepMinSlopeDegrees)), 2.0 * Radius, true))
 		{
 			const double RunStartAlong = Profile.Along[Stretch.RunStart];
 			const double RunEndAlong = Profile.Along[Stretch.RunEnd];
-			const double Foot = Profile.MinZ[Stretch.Low];
+			const double Foot = FMath::Max(Profile.MinZ[Stretch.Low], LowestEndZ);
 			double Top = -UE_BIG_NUMBER;
 			double Edge = Stretch.bUphill ? RunEndAlong : RunStartAlong;
 			bool bEdgeFound = false;
@@ -1187,18 +1495,29 @@ namespace TerrainBelts
 					bEdgeFound = true;
 				}
 			}
-			const double At = Stretch.bUphill ? Edge - PipeStepWallClearance : Edge + PipeStepWallClearance;
+			// The first high ground sample can be one sample spacing inside the platform. Keep
+			// the entire top bend, including the pipe's width, outside that uncertain edge.
+			const double EdgeStandOff = FMath::Max(PipeStepWallClearance,
+				Radius + Settings.HalfWidth + Settings.GroundSampleSpacing);
+			// An edge beside the high end may leave less than one bend of horizontal room.
+			// Move the riser farther out over the low side so the high bend still fits.
+			const double At = Stretch.bUphill
+				? FMath::Min(Edge - EdgeStandOff, Length - Zone)
+				: FMath::Max(Edge + EdgeStandOff, Zone);
+			// The high endpoint already includes its support clearance. Adding the rise margin
+			// there creates a small hump immediately after the support and fails curvature.
+			const double TopLevel = PipeStepTopHeight(Profile, Stretch, Top + PipeRiseMargin);
 
 			const bool bClearOfEnds = At >= Zone && At <= Length - Zone;
 			const bool bClearOfLast = StepAt.IsEmpty() || At - StepAt.Last() >= 2.0 * Zone;
-			// Both bends and some straight have to fit in the rise, or the riser folds back on itself.
-			const bool bTallEnough = Top + PipeRiseMargin - Foot >= 2.0 * Radius + PipeMinStraight;
+			// A short stair can join its two elbows directly, with no straight riser between them.
+			const bool bTallEnough = TopLevel - Foot >= 2.0 * Radius;
 			if (bClearOfEnds && bClearOfLast && bTallEnough)
 			{
 				Steps.Add(Stretch);
 				StepAt.Add(At);
 				FootZ.Add(Foot);
-				TopZ.Add(Top + PipeRiseMargin);
+				TopZ.Add(TopLevel);
 			}
 		}
 		if (Steps.IsEmpty())
@@ -1208,6 +1527,10 @@ namespace TerrainBelts
 
 		// Over each steep stretch, on the high side of its step, the pipe stays level with the top.
 		TArray<double> MinZ = Profile.MinZ;
+		for (double& Z : MinZ)
+		{
+			Z = FMath::Max(Z, LowestEndZ);
+		}
 		for (int32 StepIndex = 0; StepIndex < Steps.Num(); ++StepIndex)
 		{
 			const FCliff& Step = Steps[StepIndex];
@@ -1232,47 +1555,58 @@ namespace TerrainBelts
 		{
 			TArray<FSplinePointData> Piece;
 			TArray<double> PieceMinZ;
+			TArray<int32> PieceSources;
 			Piece.Add(PieceStart);
 			PieceMinZ.Add(PieceStart.Location.Z);
+			PieceSources.Add(Out.IsEmpty() ? 0 : INDEX_NONE);
 			for (; NextIndex + 1 < Num && Profile.Along[NextIndex] < PieceEndAlong; ++NextIndex)
 			{
 				// The bends sit a fixed Radius from the riser, which can be off a curving route, so
 				// distances along the route aren't enough: a point could land behind a bend end and
 				// the pipe would double back on itself.
 				const FVector& Location = Points[NextIndex].Location;
-				const bool bMovesOn = IsAhead(Piece.Last(), Location, PipeMinStraight);
-				const bool bShortOfEnd = IsAhead(FSplinePointData(Location, PieceEnd.ArriveTangent), PieceEnd.Location, PipeMinStraight);
+				const bool bMovesOn = Out.IsEmpty() || Piece.Num() > 1 || IsAhead(PieceStart, Location, PipeMinStraight);
+				const bool bShortOfEnd = PieceEndAlong == Length || IsAhead(FSplinePointData(Location, PieceEnd.ArriveTangent), PieceEnd.Location, PipeMinStraight);
 				if (bMovesOn && bShortOfEnd)
 				{
 					Piece.Add(Points[NextIndex]);
 					PieceMinZ.Add(MinZ[NextIndex]);
+					PieceSources.Add(NextIndex);
 				}
 			}
 			Piece.Add(PieceEnd);
 			PieceMinZ.Add(PieceEnd.Location.Z);
+			PieceSources.Add(PieceEndAlong == Length ? Num - 1 : INDEX_NONE);
 
-			// The new ends meet the bends horizontally; size their tangents to the piece.
-			if (Out.IsEmpty())
-			{
-				Piece[0].LeaveTangent = RescaleTangent(Piece[0].LeaveTangent, Piece[1].Location - Piece[0].Location);
-			}
-			else
-			{
-				Piece[0].LeaveTangent = Piece[0].LeaveTangent.GetSafeNormal() * FVector::Dist(Piece[0].Location, Piece[1].Location);
-			}
 			const int32 Last = Piece.Num() - 1;
-			Piece[Last].ArriveTangent = RescaleTangent(Piece[Last].ArriveTangent, Piece[Last].Location - Piece[Last - 1].Location);
-
-			// Points near the bends were dropped, so the neighbours' tangents (sized for the original
-			// 4 m steps) would overshoot the shorter segments and kink. Size each to its own segment.
-			for (int32 Index = 1; Index < Last; ++Index)
+			// Keep vanilla's exact curve on untouched segments. Resizing all tangents to their
+			// chords sharpens its horizontal endpoint elbows, especially with dense stair points.
+			// Only a new bend endpoint or a skipped profile point changes the segment's length.
+			for (int32 Index = 0; Index <= Last; ++Index)
 			{
 				FSplinePointData& Point = Piece[Index];
-				Point.ArriveTangent = RescaleTangent(Point.ArriveTangent, Point.Location - Piece[Index - 1].Location);
-				Point.LeaveTangent = RescaleTangent(Point.LeaveTangent, Piece[Index + 1].Location - Point.Location);
+				if (Index > 0 && !(PieceSources[Index] > 0 && PieceSources[Index - 1] == PieceSources[Index] - 1))
+				{
+					Point.ArriveTangent = RescaleTangent(Point.ArriveTangent, Point.Location - Piece[Index - 1].Location);
+				}
+				if (Index < Last && !(PieceSources[Index] >= 0 && PieceSources[Index + 1] == PieceSources[Index] + 1))
+				{
+					Point.LeaveTangent = RescaleTangent(Point.LeaveTangent, Piece[Index + 1].Location - Point.Location);
+				}
 			}
 
-			if (!FinishDrape(Piece, PieceMinZ, Settings))
+			// Keep each run above its lower connector instead of sagging toward the platform.
+			const double ConnectorFloor = FMath::Min(Piece[0].Location.Z, Piece.Last().Location.Z);
+			for (int32 Index = 1; Index < Last; ++Index)
+			{
+				PieceMinZ[Index] = FMath::Max(PieceMinZ[Index], ConnectorFloor);
+			}
+			TArray<FSplinePointData> Direct = Piece;
+			if (StraightenPipeRun(Direct) && HasPipelineGroundClearance(ToLocalPoints(Direct, ToWorld), Hologram, Settings))
+			{
+				Piece = MoveTemp(Direct);
+			}
+			else if (!FinishDrape(Piece, PieceMinZ, Settings))
 			{
 				return false;
 			}
@@ -1317,8 +1651,15 @@ namespace TerrainBelts
 
 			// Bend, straight vertical part, bend.
 			const double Straight = FMath::Abs(ToZ - FromZ) - 2.0 * Radius;
-			Out.Emplace(FVector(CentreXY, FromZ + Sign * Radius), Up * Bend, Up * Straight);
-			Out.Emplace(FVector(CentreXY, ToZ - Sign * Radius), Up * Straight, Up * Bend);
+			if (Straight > 0.0)
+			{
+				Out.Emplace(FVector(CentreXY, FromZ + Sign * Radius), Up * Bend, Up * Straight);
+				Out.Emplace(FVector(CentreXY, ToZ - Sign * Radius), Up * Straight, Up * Bend);
+			}
+			else
+			{
+				Out.Emplace(FVector(CentreXY, FromZ + Sign * Radius), Up * Bend, Up * Bend);
+			}
 			Out.Emplace(FVector(AfterXY, ToZ), AfterDirection * Bend, AfterDirection);
 
 			PieceStart = Out.Last();
@@ -1766,6 +2107,17 @@ bool FTerrainBeltsModule::ApplyAutoLift(AFGConveyorBeltHologram* Belt, const Ter
 	{
 		return false;
 	}
+	const double ClearanceOffset = AutoLiftClearanceOffset(Profile);
+	if (ClearanceOffset > 0.0)
+	{
+		// All lift feet and connecting belt pieces use the same support clearance, including
+		// plateaus between the second/third lifts. The ordinary terrain drape stays unchanged.
+		LiftSettings.GroundClearance += ClearanceOffset;
+		if (!BuildProfile(ToWorldPoints(Belt->mSplineData, BeltTransform), Belt, LiftSettings, Profile))
+		{
+			return false;
+		}
+	}
 
 	const TArray<FSplinePointData>& Points = Profile.Points;
 	const int32 Num = Points.Num();
@@ -1854,9 +2206,15 @@ bool FTerrainBeltsModule::ApplyAutoLift(AFGConveyorBeltHologram* Belt, const Ter
 	}
 	if (Chosen.IsEmpty())
 	{
-		if (FirstTime(TEXT("no room for lift")))
+		if (FirstTime(*FString::Printf(TEXT("no room for lift:%d"), Cliffs.Num())))
 		{
-			UE_LOG(LogTerrainBelts, Display, TEXT("Auto-lift: plain belt too steep, but no cliff with room for a lift (%d steep stretches, belt %.0f cm)"), Cliffs.Num(), TotalLength);
+			UE_LOG(LogTerrainBelts, Display, TEXT("Auto-lift: no cliff with room for a lift (%d steep stretches, belt %.0f cm, minimum %.0f cm on each side), endpoints %s -> %s"),
+				Cliffs.Num(), TotalLength, AutoLiftMinBeltLength, *Points[0].Location.ToString(), *Points.Last().Location.ToString());
+			for (const FCliff& Cliff : Cliffs)
+			{
+				UE_LOG(LogTerrainBelts, Display, TEXT("    candidate: %s, rise %.0f cm, low point %d, room before %.0f cm / after %.0f cm"),
+					Cliff.bUphill ? TEXT("uphill") : TEXT("downhill"), Cliff.Rise, Cliff.Low, Profile.Along[Cliff.Low], TotalLength - Profile.Along[Cliff.Low]);
+			}
 		}
 		return false;
 	}
@@ -1874,7 +2232,10 @@ bool FTerrainBeltsModule::ApplyAutoLift(AFGConveyorBeltHologram* Belt, const Ter
 	{
 		const FCliff& Cliff = Chosen[LiftIndex];
 		const int32 Low = Cliff.Low;
-		const double LiftHeight = LiftHeightFor(Cliff);
+		const double LowZ = LiftFootHeight(Profile, Low, Cliff.bUphill);
+		FCliff AdjustedCliff = Cliff;
+		AdjustedCliff.Rise = FMath::Max(0.0, Cliff.Rise - (LowZ - Profile.MinZ[Low]));
+		const double LiftHeight = LiftHeightFor(AdjustedCliff);
 
 		// Belt direction at the foot of the cliff, kept horizontal where it meets the lift.
 		FVector Direction = Points[Low].LeaveTangent.GetSafeNormal2D();
@@ -1883,7 +2244,6 @@ bool FTerrainBeltsModule::ApplyAutoLift(AFGConveyorBeltHologram* Belt, const Ter
 			Direction = (Points[Low + 1].Location - Points[Low - 1].Location).GetSafeNormal2D();
 		}
 
-		const double LowZ = Profile.MinZ[Low];
 		const bool bFlowsUp = Cliff.bUphill != bReversed;
 		const FVector Input(FVector2D(Points[Low].Location), bFlowsUp ? LowZ : LowZ + LiftHeight);
 		FVector Output;
@@ -1931,8 +2291,24 @@ bool FTerrainBeltsModule::ApplyAutoLift(AFGConveyorBeltHologram* Belt, const Ter
 			const FVector& Direction = Directions[PieceIndex];
 			Piece.Last() = FSplinePointData(Entries[PieceIndex], Direction * FMath::Max(1.0, FVector2D(Piece.Last().ArriveTangent).Size()));
 		}
+		// A split already uses lifts for the height changes; do not add a dip below both
+		// connectors between them. Ground above this floor still raises the belt normally.
+		const double ConnectorFloor = FMath::Min(Piece[0].Location.Z, Piece.Last().Location.Z);
+		for (int32 Index = 1; Index + 1 < PieceMinZ.Num(); ++Index)
+		{
+			PieceMinZ[Index] = FMath::Max(PieceMinZ[Index], ConnectorFloor);
+		}
 		if (!FinishDrape(Piece, PieceMinZ, Settings, SliceSamples(Profile.Samples, From, To - From)))
 		{
+			if (FirstTime(*FString::Printf(TEXT("auto-lift:rejected-piece:%d"), PieceIndex)))
+			{
+				UE_LOG(LogTerrainBelts, Display, TEXT("Auto-lift: rejected belt piece %d of %d (%d points), endpoints %s -> %s, reversed %s"),
+					PieceIndex, Chosen.Num() + 1, Piece.Num(), *Piece[0].Location.ToString(), *Piece.Last().Location.ToString(), bReversed ? TEXT("yes") : TEXT("no"));
+				for (int32 Index = 0; Index < Piece.Num(); ++Index)
+				{
+					UE_LOG(LogTerrainBelts, Display, TEXT("    point %d: %s, required Z %.0f"), Index, *Piece[Index].Location.ToString(), PieceMinZ[Index]);
+				}
+			}
 			return false;
 		}
 		Pieces.Add(MoveTemp(Piece));
@@ -2146,9 +2522,93 @@ void FTerrainBeltsModule::ConnectBuiltPieces(const AFGHologram* Hologram, AFGBui
 	}
 }
 
+void FTerrainBeltsModule::RemoveUnevenSurfaceDisqualifier(AFGBuildableHologram* Hologram)
+{
+	if (!TerrainBelts::AllowUnevenSurfaces(Hologram))
+	{
+		return;
+	}
+	// Restrict standalone supports as well as child supports; power poles and unrelated
+	// buildings keep their normal floor checks.
+	const UClass* BuildClass = Hologram->GetBuildClass();
+	// Wall and ceiling supports use generic buildable classes and attachment holograms.
+	// Match their actual asset classes (including derived mods), rather than exempting
+	// every wall attachment or every object with a pipe/conveyor connection.
+	bool bAttachmentSupport = false;
+	for (const UClass* Class = BuildClass; Class != nullptr; Class = Class->GetSuperClass())
+	{
+		static const TSet<FName> AttachmentSupportClasses = {
+			FName(TEXT("/Game/FactoryGame/Buildable/Factory/ConveyorPoleWall/Build_ConveyorPoleWall.Build_ConveyorPoleWall_C")),
+			FName(TEXT("/Game/FactoryGame/Buildable/Factory/ConveyorPoleWall/Build_ConveyorCeilingAttachment.Build_ConveyorCeilingAttachment_C")),
+			FName(TEXT("/Game/FactoryGame/Buildable/Factory/PipelineSupportWall/Build_PipelineSupportWall.Build_PipelineSupportWall_C")),
+			FName(TEXT("/Game/FactoryGame/Buildable/Factory/HyperTubeWallSupport/Build_HyperTubeWallSupport.Build_HyperTubeWallSupport_C"))
+		};
+		if (AttachmentSupportClasses.Contains(FName(*Class->GetPathName())))
+		{
+			bAttachmentSupport = true;
+			break;
+		}
+	}
+	const bool bSplineOrSupport = Hologram->IsA<AFGConveyorBeltHologram>() ||
+		Hologram->IsA<AFGConveyorLiftHologram>() || Hologram->IsA<AFGPipelineHologram>() ||
+		Hologram->IsA<AFGRailroadTrackHologram>() || Hologram->IsA<AFGConveyorPoleHologram>() ||
+		Hologram->IsA<AFGConveyorMultiPoleHologram>() || Hologram->IsA<AFGPipelinePoleHologram>() || bAttachmentSupport ||
+		(BuildClass != nullptr && (BuildClass->IsChildOf(AFGBuildablePoleConveyor::StaticClass()) ||
+			BuildClass->IsChildOf(AFGBuildablePoleStackable::StaticClass())));
+	if (bSplineOrSupport)
+	{
+		Hologram->mConstructDisqualifiers.Remove(UFGCDInvalidFloor::StaticClass());
+	}
+}
+
 void FTerrainBeltsModule::RegisterHooks()
 {
 	using namespace TerrainBelts;
+
+	// Filter immediately after floor validation, before placement validity/materials are
+	// evaluated. Keep every other rejection, including our later pipe ground-clearance check.
+	const auto FilterUnevenFloor = [](AFGBuildableHologram* Hologram)
+	{
+		RemoveUnevenSurfaceDisqualifier(Hologram);
+	};
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGBuildableHologram, CheckValidFloor, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGFactoryBuildingHologram, CheckValidFloor, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGConveyorBeltHologram, CheckValidFloor, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGConveyorLiftHologram, CheckValidFloor, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGPipelineHologram, CheckValidFloor, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGRailroadTrackHologram, CheckValidFloor, FilterUnevenFloor);
+
+	// Like Construction Preferences, change the placement limit after vanilla initializes it.
+	// Use the class default as the baseline so child holograms don't compound the multiplier.
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGConveyorBeltHologram, BeginPlay,
+		[](AFGConveyorBeltHologram* Hologram)
+		{
+			const float BaseLength = Hologram->GetClass()->GetDefaultObject<AFGConveyorBeltHologram>()->mMaxSplineLength;
+			Hologram->mMaxSplineLength = BaseLength * GetLengthMultiplier(Hologram);
+		});
+
+	// Lift height is initialized from the buildable in BeginPlay, rather than on the CDO.
+	// This includes the child lifts spawned for automatic cliff placement.
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGConveyorLiftHologram, BeginPlay,
+		[](AFGConveyorLiftHologram* Hologram)
+		{
+			Hologram->mMaximumHeight *= GetLengthMultiplier(Hologram);
+		});
+
+	// Hypertubes use the same hologram class as pipelines, with their own class defaults.
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGPipelineHologram, BeginPlay,
+		[](AFGPipelineHologram* Hologram)
+		{
+			const float BaseLength = Hologram->GetClass()->GetDefaultObject<AFGPipelineHologram>()->mMaxSplineLength;
+			Hologram->mMaxSplineLength = BaseLength * GetLengthMultiplier(Hologram);
+		});
+
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGRailroadTrackHologram, BeginPlay,
+		[](AFGRailroadTrackHologram* Hologram)
+		{
+			const float BaseLength = Hologram->GetClass()->GetDefaultObject<AFGRailroadTrackHologram>()->mMaxLength;
+			Hologram->mMaxLength = BaseLength * GetLengthMultiplier(Hologram);
+		});
 
 	// Runs after vanilla GenerateAndUpdateSpline. In Follow Terrain, vanilla matches none of its
 	// own build modes and falls back to its default auto-route, which this drapes.
@@ -2229,7 +2689,9 @@ void FTerrainBeltsModule::RegisterHooks()
 				.SmoothingPasses = BeltSmoothingPasses,
 				.HalfWidth = BeltHalfWidth,
 				.GroundSampleSpacing = BeltGroundSampleSpacing,
-				.VerticalBendRadius = BeltVerticalBendRadius});
+				.VerticalBendRadius = BeltVerticalBendRadius,
+				.bKeepLevelOnFlatGround = true,
+				.bEnforceIncline = true});
 			if (Hologram->IsCurrentBuildMode(UTerrainBeltsBuildMode::StaticClass()) && ApplyAutoLift(Hologram, Settings))
 			{
 				return;
@@ -2241,14 +2703,21 @@ void FTerrainBeltsModule::RegisterHooks()
 	SUBSCRIBE_METHOD_AFTER(AFGPipelineHologram::GenerateAndUpdateSpline,
 		[DrapeHologram](AFGPipelineHologram* Hologram, const FHitResult& HitResult)
 		{
+			PipelineGroundFailures.Remove(FObjectKey(Hologram));
 			const TSubclassOf<AActor> BuildClass = Hologram->GetBuildClass();
 			const bool bHypertube = BuildClass != nullptr && BuildClass->IsChildOf(AFGBuildablePipeHyper::StaticClass());
 			const TCHAR* Kind = bHypertube ? TEXT("hypertube") : TEXT("pipe");
+			const double VanillaClearance = Hologram->GetHologramHoverHeight();
+			const double GroundClearance = bHypertube ? HypertubeClearance : FMath::Max(PipeClearance, VanillaClearance);
+			if (!bHypertube && FirstTime(TEXT("pipe:vanilla-clearance")))
+			{
+				UE_LOG(LogTerrainBelts, Display, TEXT("Pipe ground clearance %.0f cm (vanilla hover height %.0f cm)"), GroundClearance, VanillaClearance);
+			}
 
 			// Parenthesised so the macro doesn't split its arguments at the braced commas.
 			const FDrapeSettings Settings = (FDrapeSettings{
 				.StepLength = PipeStepLength,
-				.GroundClearance = bHypertube ? HypertubeClearance : PipeClearance,
+				.GroundClearance = GroundClearance,
 				.MaxInclineDegrees = PipeMaxInclineDegrees,
 				.SmoothingPasses = PipeSmoothingPasses,
 				.HalfWidth = bHypertube ? HypertubeHalfWidth : PipeHalfWidth,
@@ -2340,7 +2809,7 @@ void FTerrainBeltsModule::RegisterHooks()
 						}
 					}
 				}
-				return Fault <= 0.0f;
+				return Fault <= 0.0f && HasPipelineGroundClearance(Hologram->mSplineData, Hologram, Settings);
 			};
 			for (int32 Attempt = AttemptStep; Attempt <= AttemptPlainDrape; ++Attempt)
 			{
@@ -2356,6 +2825,23 @@ void FTerrainBeltsModule::RegisterHooks()
 			}
 			Hologram->mSplineData = Vanilla;
 			Hologram->UpdateSplineComponent();
+			if (!HasPipelineGroundClearance(Vanilla, Hologram, Settings))
+			{
+				if (PipelineGroundFailures.Num() >= MaxProfileCacheHolograms)
+				{
+					PipelineGroundFailures.Reset();
+				}
+				PipelineGroundFailures.Add(FObjectKey(Hologram));
+			}
+		});
+
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGPipelineHologram, CheckValidPlacement,
+		[](AFGPipelineHologram* Hologram)
+		{
+			if (Hologram->IsCurrentBuildMode(UTerrainBeltsBuildMode::StaticClass()) && PipelineGroundFailures.Contains(FObjectKey(Hologram)))
+			{
+				Hologram->mConstructDisqualifiers.AddUnique(UFGCDInvalidFloor::StaticClass());
+			}
 		});
 
 	// Rails: put vanilla's own spline back first, so vanilla never runs on a draped one.

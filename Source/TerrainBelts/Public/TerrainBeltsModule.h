@@ -5,6 +5,7 @@
 
 class AActor;
 class AFGBuildable;
+class AFGBuildableHologram;
 class AFGConveyorBeltHologram;
 class AFGConveyorLiftHologram;
 class AFGHologram;
@@ -25,6 +26,7 @@ private:
 	// access to the holograms' protected/private state, and the hook lambdas inside
 	// RegisterHooks share that access.
 	static void RegisterHooks();
+	static void RemoveUnevenSurfaceDisqualifier(AFGBuildableHologram* Hologram);
 
 	// Auto-lift: in Follow Terrain, a belt that meets a cliff too steep for it is split into
 	// belt -> lift -> belt, using a lift and a second belt spawned as disabled children.

@@ -4,13 +4,25 @@
 
 Adds a **Follow Terrain** build mode to conveyor belts, pipes, hypertubes and railway tracks. Drag one
 across a hill and it drapes over the ground instead of cutting straight through it.
+Also increases the maximum length of belts, pipes, hypertubes and rails, and the maximum height of
+conveyor lifts, with a configurable multiplier that defaults to **8×**.
+An optional setting also lets you place these lines and their supports on uneven surfaces.
 
 ## Features
 
+- **Allow uneven surfaces:** optionally remove the “Surface is too uneven” restriction for belts,
+  conveyor lifts, pipes, hypertubes, railway tracks and their supports. Includes standalone and
+  automatically placed supports, stackable supports, and belt, pipe and hypertube wall/ceiling supports.
+  Works in every build mode.
+- **Longer placements:** belts, pipes, hypertubes and rails default to **8×** their normal maximum
+  segment length, and conveyor lifts to **8×** their normal maximum height, in every build mode.
+  This also applies to automatically placed lifts. Change **Maximum length multiplier** (1–32×) under
+  **Mods → Terrain Belts → settings**. The new value applies when you start a new placement;
+  existing built segments are unchanged. Use matching settings on all players and the server.
 - **Follow Terrain build mode:** cycle build modes while holding a belt, pipe, hypertube or track and pick
   *Follow Terrain*. The route keeps the same shape from above as vanilla's; only the height changes, so
   it hugs the slope.
-- **Stays within the game's limits:** slopes are capped at the belt's or pipe's maximum incline, and
+- **Respects slope and curvature limits:** slopes are capped at the belt's or pipe's maximum incline, and
   bumps are smoothed so the result passes the game's own curvature checks. Where the ground is too steep,
   the line is lifted rather than sunk, so it never ends up underground.
 - **Automatic conveyor lifts:** when a belt meets a slope too steep for it, a conveyor lift is placed
@@ -24,6 +36,19 @@ across a hill and it drapes over the ground instead of cutting straight through 
 
 Railway tracks have no build modes of their own, so they get a *Default* mode alongside Follow Terrain.
 
+## Settings
+
+Open **Mods → Terrain Belts → settings** to configure:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| **Allow uneven surfaces** | Off | Removes the uneven-surface placement restriction immediately, including during an active placement. |
+| **Maximum length multiplier** | 8× | Adjusts maximum segment length and conveyor lift height from 1–32×. Applies when you start a new placement. |
+
+Allowing uneven surfaces keeps the other placement checks, including slope, curvature, snapping,
+collision and Follow Terrain's pipe ground-clearance checks. It does not change existing buildings.
+Settings are shared across your saves. Use matching values on every player and the server in multiplayer.
+
 ## Multiplayer
 
 Every player needs the mod. **Multiplayer and dedicated servers have not been tested yet.** If
@@ -31,8 +56,6 @@ something misbehaves for clients, please open an issue.
 
 ## Known limitations
 
-- Draped lines are longer than straight ones, so on hilly ground you hit the maximum belt length sooner,
-  and they cost a little more.
 - Under overhangs and in caves the ground check can land on the ceiling.
 - On hilly ground, railway tracks can only rise, so they may end up raised well above the ground.
 - Blueprints and the blueprint designer are not supported yet.
