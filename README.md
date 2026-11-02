@@ -1,5 +1,7 @@
 # Follow Terrain
 
+<img src="logo.png" alt="Follow Terrain" width="400">
+
 Adds a **Follow Terrain** build mode to conveyor belts, pipes, hypertubes and railway tracks. Drag one
 across a hill and it drapes over the ground instead of cutting straight through it.
 
