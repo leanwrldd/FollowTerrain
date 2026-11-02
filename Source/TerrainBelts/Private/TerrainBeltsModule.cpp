@@ -607,8 +607,12 @@ namespace TerrainBelts
 			return false;
 		}
 
-		Out.Points = DropVerticalRuns(Subdivide(WorldPoints, Settings.StepLength));
-		if (Settings.bSmoothRoute)
+		const TArray<FSplinePointData> Dense = Subdivide(WorldPoints, Settings.StepLength);
+		Out.Points = DropVerticalRuns(Dense);
+		// Only re-shape the route where vertical runs were dropped and left corners. Otherwise
+		// the subdivided points carry vanilla's exact horizontal curve, and re-shaping it through
+		// thinned points turned a tight vanilla bend at a support into a sharper one.
+		if (Settings.bSmoothRoute && Out.Points.Num() < Dense.Num())
 		{
 			// Points this close make a curve about this tight, so keep them at least twice the
 			// tightest bend apart. A short route thinned below three points can't be draped, so
@@ -826,8 +830,13 @@ namespace TerrainBelts
 		const double HighestAllowedZ = FMath::Max(MinZ) + MaxDrapeRise;
 
 		// Each end keeps vanilla's tangent (a pipe leaving a support level, say), and the curve
-		// can't turn away from it faster than the exit radius. Without this the drape dropped
-		// straight to the ground beside a support and the pipe kinked right at the end.
+		// can't turn away from it faster than the exit radius, down or up. So near an end every
+		// point stays between two parabolas around the end's direction. Without the lower one the
+		// drape dropped straight to the ground beside a support; without the upper one it climbed
+		// a dune right beside the support. Either way the pipe kinked at the end. Near an end,
+		// the pipe may clip rising ground instead, as vanilla's does.
+		TArray<double> MaxZ;
+		MaxZ.Init(UE_BIG_NUMBER, Num);
 		if (Settings.MinBendRadius > 0.0)
 		{
 			const double ExitRadius = EndExitBendScale * Settings.MinBendRadius;
@@ -842,18 +851,29 @@ namespace TerrainBelts
 				for (int32 Index = 1; Index + 1 < Num; ++Index)
 				{
 					const double Distance = DistanceFromEnd(Index);
-					MinZ[Index] = FMath::Max(MinZ[Index], EndZ + Slope * Distance - FMath::Square(Distance) / (2.0 * ExitRadius));
+					const double Line = EndZ + Slope * Distance;
+					const double Bend = FMath::Square(Distance) / (2.0 * ExitRadius);
+					MaxZ[Index] = FMath::Min(MaxZ[Index], Line + Bend);
+					MinZ[Index] = FMath::Max(MinZ[Index], Line - Bend);
 				}
 			};
 			KeepExit(Points[0].LeaveTangent, Points[0].Location.Z, [&](int32 Index) { return Along[Index]; });
 			KeepExit(-Points.Last().ArriveTangent, Points.Last().Location.Z, [&](int32 Index) { return Along[Num - 1] - Along[Index]; });
+			for (int32 Index = 1; Index + 1 < Num; ++Index)
+			{
+				MinZ[Index] = FMath::Min(MinZ[Index], MaxZ[Index]);
+			}
 		}
 
 		constexpr int32 MaxSampleRounds = 4;
 		constexpr double SampleTolerance = 2.0;
 		for (int32 Round = 0; Round < MaxSampleRounds; ++Round)
 		{
-			const TArray<double> Z = SolveHeights(MinZ, Step, MaxSlope, Settings);
+			TArray<double> Z = SolveHeights(MinZ, Step, MaxSlope, Settings);
+			for (int32 Index = 1; Index + 1 < Num; ++Index)
+			{
+				Z[Index] = FMath::Min(Z[Index], MaxZ[Index]);
+			}
 			for (int32 Index = 1; Index + 1 < Num; ++Index)
 			{
 				FSplinePointData& Point = Points[Index];
@@ -887,12 +907,12 @@ namespace TerrainBelts
 				const double RaiseB = Deficit;
 				if (bMoveA)
 				{
-					MinZ[Sample.Segment] = FMath::Max(MinZ[Sample.Segment], Z[Sample.Segment] + RaiseA);
+					MinZ[Sample.Segment] = FMath::Min(FMath::Max(MinZ[Sample.Segment], Z[Sample.Segment] + RaiseA), MaxZ[Sample.Segment]);
 					bRaised = true;
 				}
 				if (bMoveB)
 				{
-					MinZ[Sample.Segment + 1] = FMath::Max(MinZ[Sample.Segment + 1], Z[Sample.Segment + 1] + RaiseB);
+					MinZ[Sample.Segment + 1] = FMath::Min(FMath::Max(MinZ[Sample.Segment + 1], Z[Sample.Segment + 1] + RaiseB), MaxZ[Sample.Segment + 1]);
 					bRaised = true;
 				}
 			}
@@ -1099,9 +1119,13 @@ namespace TerrainBelts
 			bool bEdgeFound = false;
 			for (int32 GroundIndex = 0; GroundIndex < Ground.Num(); ++GroundIndex)
 			{
-				// Uphill scans forward from the foot, downhill backward from it.
+				// Uphill scans forward from the foot, downhill backward from it. The top also looks a
+				// little past the steep stretch on the high side: ground still rising there (onto a
+				// platform, say) would otherwise force a second, too-tight bend right after the step.
 				const TPair<double, double>& Spot = Ground[Stretch.bUphill ? GroundIndex : Ground.Num() - 1 - GroundIndex];
-				if (Spot.Key < RunStartAlong || Spot.Key > RunEndAlong)
+				const double ScanFrom = Stretch.bUphill ? RunStartAlong : RunStartAlong - 2.0 * Zone;
+				const double ScanTo = Stretch.bUphill ? RunEndAlong + 2.0 * Zone : RunEndAlong;
+				if (Spot.Key < ScanFrom || Spot.Key > ScanTo)
 				{
 					continue;
 				}
@@ -1320,17 +1344,22 @@ namespace TerrainBelts
 			const UWorld* World = Hologram->GetWorld();
 			double GroundAtTip;
 			double GroundAtBendEnd;
-			const double Top = Tip.Z - 10.0; // below whatever the end hangs from
+			// Start below the bend: the end sits inside the floor it hangs from (a pipe floor hole),
+			// and a trace starting there found that floor itself and left no room to drop.
+			const double Top = Tip.Z - Radius;
 			const double Bottom = Tip.Z - MaxRiserDrop;
-			if (World == nullptr ||
-				!FindGroundZ(World, Hologram, FVector2D(Tip), Top, Bottom, Tip.Z, GroundAtTip) ||
-				!FindGroundZ(World, Hologram, FVector2D(BendEnd), Top, Bottom, Tip.Z, GroundAtBendEnd))
-			{
-				return Default;
-			}
-			const double Level = FMath::Max(GroundAtTip, GroundAtBendEnd) + Settings.GroundClearance;
+			const bool bFound = World != nullptr &&
+				FindGroundZ(World, Hologram, FVector2D(Tip), Top, Bottom, Top, GroundAtTip) &&
+				FindGroundZ(World, Hologram, FVector2D(BendEnd), Top, Bottom, Top, GroundAtBendEnd);
+			const double Level = bFound ? FMath::Max(GroundAtTip, GroundAtBendEnd) + Settings.GroundClearance : Default;
 			// Keep the bend and some straight between the level and the tip.
-			return Level <= Default - PipeMinStraight ? Level : Default;
+			const double Result = Level <= Default - PipeMinStraight ? Level : Default;
+			if (FirstTime(*FString::Printf(TEXT("riser %d"), static_cast<int32>(Result < Default))))
+			{
+				UE_LOG(LogTerrainBelts, Display, TEXT("Vertical pipe end at Z %.0f: ground %s (%.0f / %.0f), level %.0f"),
+					Tip.Z, bFound ? TEXT("found") : TEXT("not found"), bFound ? GroundAtTip : 0.0, bFound ? GroundAtBendEnd : 0.0, Result);
+			}
+			return Result;
 		};
 		double StartLevel = Start.Location.Z + StartSign * Radius;
 		if (bStartVertical && StartSign < 0.0)
@@ -1344,7 +1373,11 @@ namespace TerrainBelts
 		}
 		const FVector First = bStartVertical ? FVector(FVector2D(Start.Location + StartDirection * Radius), StartLevel) : Start.Location;
 		const FVector Last = bEndVertical ? FVector(FVector2D(End.Location - EndDirection * Radius), EndLevel) : End.Location;
-		if (FVector::Dist2D(First, Last) < 2.0 * PipeMinStraight)
+		// Ends so close that the bends meet or pass each other: no room for this shape.
+		const FVector2D Between = FVector2D(Last - First);
+		const bool bBendsApart = (!bStartVertical || (Between | FVector2D(StartDirection)) >= 2.0 * PipeMinStraight) &&
+			(!bEndVertical || (Between | FVector2D(EndDirection)) >= 2.0 * PipeMinStraight);
+		if (FVector::Dist2D(First, Last) < 2.0 * PipeMinStraight || !bBendsApart)
 		{
 			return ShapeMiddle(SplineData);
 		}
@@ -2185,11 +2218,36 @@ void FTerrainBeltsModule::RegisterHooks()
 			// Terrain never leaves a pipe invalid that vanilla could have placed.
 			const double BendRadius = FMath::Max(PipeRiserBendRadius, Settings.MinBendRadius);
 			const TArray<FSplinePointData> Vanilla = Hologram->mSplineData;
+
+			// A free end (snapped to nothing) that isn't vertical leaves level, like vanilla's own
+			// horizontal-to-vertical mode. Vanilla's default route tilts it towards the other end
+			// (steeply down from a ceiling), which no longer fits once the pipe runs along the
+			// ground: the last metre had to swing into the tilt and failed the curvature check.
+			TArray<FSplinePointData> Leveled = Vanilla;
+			if (Leveled.Num() >= 2)
+			{
+				auto Level = [](FVector& Tangent)
+				{
+					const double Horizontal = FVector2D(Tangent).Size();
+					if (Horizontal > 0.3 * Tangent.Size())
+					{
+						Tangent = FVector(FVector2D(Tangent).GetSafeNormal() * Tangent.Size(), 0.0);
+					}
+				};
+				if (Hologram->mSnappedConnectionComponents[0] == nullptr)
+				{
+					Level(Leveled[0].LeaveTangent);
+				}
+				if (Hologram->mSnappedConnectionComponents[1] == nullptr)
+				{
+					Level(Leveled.Last().ArriveTangent);
+				}
+			}
 			constexpr int32 AttemptStep = 0; // then 1: drape between vertical ends
 			constexpr int32 AttemptPlainDrape = 2;
 			auto Shape = [&](int32 Attempt) -> bool
 			{
-				Hologram->mSplineData = Vanilla;
+				Hologram->mSplineData = Leveled;
 				bool bShaped;
 				if (Attempt == AttemptPlainDrape)
 				{
@@ -2211,13 +2269,17 @@ void FTerrainBeltsModule::RegisterHooks()
 				Hologram->UpdateSplineComponent();
 				const float Fault = Hologram->ValidateCurvatureAndReturnFaultyPosition();
 				static int32 FaultsLogged = 0;
-				if (Fault > 0.0f && FaultsLogged++ < 30)
+				static int32 LastDumpedPoints = 0;
+				if (Fault > 0.0f && FaultsLogged++ < 60)
 				{
 					UE_LOG(LogTerrainBelts, Display, TEXT("%s shape %d bends too tightly %.0f cm along (%d points, at %s); trying a simpler shape"),
 						Kind, Attempt, Fault, Hologram->mSplineData.Num(),
 						*Hologram->mSplineComponent->GetLocationAtDistanceAlongSpline(Fault, ESplineCoordinateSpace::World).ToString());
-					if (FaultsLogged <= 6)
+					// Dump each differently shaped failure (not just the first few, which may all be a
+					// short pipe while aiming).
+					if (Hologram->mSplineData.Num() != LastDumpedPoints)
 					{
+						LastDumpedPoints = Hologram->mSplineData.Num();
 						const FTransform& ToWorld = Hologram->GetActorTransform();
 						for (const FSplinePointData& Point : Hologram->mSplineData)
 						{
