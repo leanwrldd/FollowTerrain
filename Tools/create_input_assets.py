@@ -58,12 +58,14 @@ pressed = unreal.new_object(unreal.InputTriggerPressed, outer=keybinds)
 # Alt + T. The chord uses the game's own Alt action, which its key rebinding recognises and
 # replaces, so a player rebind doesn't keep a stray Alt requirement. Chorded mappings also win over
 # plain T (Hide HUD) while Alt is held.
-alt = unreal.new_object(unreal.InputTriggerChordAction, outer=keybinds)
-# EditInstanceOnly, so set_editor_property refuses it on an asset's subobject; it's also
-# BlueprintReadWrite, which plain attribute access goes by.
-alt.chord_action = unreal.load_asset(CHORD_ALT)
-if alt.chord_action is None:
+# ChordAction is EditInstanceOnly and Python treats anything inside the asset as a template, so set
+# it on a transient trigger and then move that into the asset.
+alt = unreal.new_object(unreal.InputTriggerChordAction)  # no outer: the transient package
+alt.set_editor_property("chord_action", unreal.load_asset(CHORD_ALT))
+if alt.get_editor_property("chord_action") is None:
     raise RuntimeError(f"Could not load {CHORD_ALT}")
+if not alt.rename(outer=keybinds):
+    raise RuntimeError("Could not move the Alt chord trigger into the keybind context")
 keybinds.set_editor_property("mappings", [
     make_mapping(keybinds, toggle, "T", [pressed, alt], "TB.ToggleFollowTerrain", "Toggle Follow Terrain"),
 ])
