@@ -2,8 +2,9 @@
 
 <img src="logo.png" alt="Follow Terrain" width="400">
 
-Adds a **Follow Terrain** build mode to conveyor belts, pipes, hypertubes and railway tracks. Drag one
-across a hill and it drapes over the ground instead of cutting straight through it.
+Adds a **Follow Terrain** toggle to conveyor belts, pipes, hypertubes and railway tracks. Press **Alt + T**
+while placing one and drag it across a hill: it drapes over the ground instead of cutting straight
+through it.
 Also increases the maximum length of belts, pipes, hypertubes and rails, and the maximum height of
 conveyor lifts, with a configurable multiplier that defaults to **8×**.
 An optional setting also lets you place these lines and their supports on uneven surfaces.
@@ -19,9 +20,13 @@ An optional setting also lets you place these lines and their supports on uneven
   This also applies to automatically placed lifts. Change **Maximum length multiplier** (1–32×) under
   **Mods → Terrain Belts → settings**. The new value applies when you start a new placement;
   existing built segments are unchanged. Use matching settings on all players and the server.
-- **Follow Terrain build mode:** cycle build modes while holding a belt, pipe, hypertube or track and pick
-  *Follow Terrain*. The route keeps the same shape from above as vanilla's; only the height changes, so
-  it hugs the slope.
+- **Follow Terrain toggle:** press **Alt + T** while placing a belt, pipe, hypertube or track to switch Follow
+  Terrain on or off. While it's on, the *Default*, *Straight* and *Curve* build modes follow the ground:
+  the route keeps the shape that mode gives it from above (a straight belt stays straight), and only the
+  height changes, so it hugs the slope. Pipe shape modes (*Noodle*, *2D*, *Horizontal to Vertical*) stay
+  vanilla. The toggle stays on between placements until you press the key again or restart the game.
+  The build gun's key hint bar shows *Follow Terrain: On* or *Off* while you place one of these.
+  Rebind it under *Options > Controls > Follow Terrain*.
 - **Respects slope and curvature limits:** slopes are capped at the belt's or pipe's maximum incline, and
   bumps are smoothed so the result passes the game's own curvature checks. Where the ground is too steep,
   the line is lifted rather than sunk, so it never ends up underground.
@@ -34,7 +39,7 @@ An optional setting also lets you place these lines and their supports on uneven
 - **Falls back to vanilla:** if a draped shape can't be placed, you get the vanilla shape instead of an
   invalid hologram.
 
-Railway tracks have no build modes of their own, so they get a *Default* mode alongside Follow Terrain.
+Railway tracks have no build modes of their own, so for them the toggle applies to every placement.
 
 ## Settings
 

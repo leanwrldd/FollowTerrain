@@ -1,9 +1,11 @@
 #include "TerrainBeltsModule.h"
 
-#include "TerrainBeltsBuildMode.h"
 #include "TerrainBeltsConfig.h"
+#include "EnhancedPlayerInput.h"
+#include "FGCharacterPlayer.h"
 #include "FGConstructDisqualifier.h"
 #include "FGFactoryConnectionComponent.h"
+#include "FGPlayerController.h"
 #include "FGRecipe.h"
 #include "FGRecipeManager.h"
 #include "Algo/Reverse.h"
@@ -21,9 +23,16 @@
 #include "Hologram/FGPipelineHologram.h"
 #include "Hologram/FGPipelinePoleHologram.h"
 #include "Hologram/FGRailroadTrackHologram.h"
+#include "Blueprint/UserWidget.h"
+#include "Engine/AssetManager.h"
+#include "Equipment/FGBuildGun.h"
+#include "Equipment/FGBuildGunBuild.h"
+#include "InputAction.h"
+#include "Input/FGChildInputMappingContext.h"
 #include "InstancedFoliageActor.h"
 #include "Patching/NativeHookManager.h"
 #include "UObject/ObjectKey.h"
+#include "UObject/UObjectIterator.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogTerrainBelts, Log, All);
 
@@ -1915,16 +1924,278 @@ namespace TerrainBelts
 		return NumActiveLifts(Hologram) > 0;
 	}
 
-	void LogBuildModes(const TCHAR* Key, const AFGHologram* Hologram, int32 NumModes)
+	// Follow Terrain is a toggle rather than a build mode: while it's on, the Default, Straight and
+	// Curve modes drape over the ground. Local to this game process; the draped spline itself is
+	// what the construct message carries.
+	bool bFollowTerrainEnabled = false;
+
+	const TCHAR* const InputContentPath = TEXT("/TerrainBelts/Input");
+	const TCHAR* const ToggleActionPath = TEXT("/TerrainBelts/Input/IA_TB_ToggleFollowTerrain.IA_TB_ToggleFollowTerrain");
+
+	UInputAction* GetToggleAction()
 	{
-		// If this never shows up, the hook landed in the wrong vtable slot or the Blueprint
-		// overrides the native event.
-		// Once per hologram class, so pipes and hypertubes (both pipeline holograms) each report.
-		if (FirstTime(*FString::Printf(TEXT("%s %s"), Key, *GetNameSafe(Hologram->GetClass()))))
+		static UInputAction* Action = []
 		{
-			UE_LOG(LogTerrainBelts, Display, TEXT("Added Follow Terrain build mode to %s (%d modes)"), *GetNameSafe(Hologram->GetClass()), NumModes);
-		}
+			UInputAction* Loaded = LoadObject<UInputAction>(nullptr, ToggleActionPath);
+			if (Loaded == nullptr)
+			{
+				UE_LOG(LogTerrainBelts, Error, TEXT("Failed to load input action %s"), ToggleActionPath);
+				return Loaded;
+			}
+			// Only native code references it, so keep it from being garbage collected.
+			Loaded->AddToRoot();
+			return Loaded;
+		}();
+		return Action;
 	}
+
+	// The rebindable key lives in a child context of the build gun's build context, so it only
+	// works while building. The game finds child contexts through the Asset Manager, which only
+	// scans game feature plugins for them, so register this mod's input folder explicitly.
+	void RegisterChildInputContexts()
+	{
+		UAssetManager::CallOrRegister_OnAssetManagerCreated(FSimpleMulticastDelegate::FDelegate::CreateLambda([]
+		{
+			const int32 NumFound = UAssetManager::Get().ScanPathForPrimaryAssets(
+				FPrimaryAssetType(UFGChildInputMappingContext::StaticClass()->GetFName()),
+				InputContentPath, UFGChildInputMappingContext::StaticClass(), false);
+			UE_LOG(LogTerrainBelts, Display, TEXT("Registered %d child input context(s) from %s"), NumFound, InputContentPath);
+		}));
+	}
+
+	void HandleInput(AFGCharacterPlayer* Player)
+	{
+		const AFGPlayerController* PlayerController = Cast<AFGPlayerController>(Player->GetController());
+		const UEnhancedPlayerInput* PlayerInput = PlayerController != nullptr ? Cast<UEnhancedPlayerInput>(PlayerController->PlayerInput) : nullptr;
+		const UInputAction* ToggleAction = GetToggleAction();
+		const FInputActionInstance* Instance = PlayerInput != nullptr && ToggleAction != nullptr ? PlayerInput->FindActionInstanceData(ToggleAction) : nullptr;
+		if (Instance == nullptr || Instance->GetTriggerEvent() != ETriggerEvent::Triggered)
+		{
+			return;
+		}
+
+		bFollowTerrainEnabled = !bFollowTerrainEnabled;
+		UE_LOG(LogTerrainBelts, Display, TEXT("Follow Terrain %s"), bFollowTerrainEnabled ? TEXT("enabled") : TEXT("disabled"));
+	}
+
+	// The build gun's key hint bar. Its rows live in the Widget_BuildMode Blueprint, so they're
+	// reached through reflection: mCachedKeybinds holds the rows on show and SetKeybindingHints
+	// replaces them. A row is a Blueprint struct with an Action and a KeyBinding text; the widget
+	// turns a "{Name}" key text into whatever key the player has bound to that key setting.
+	const TCHAR* const BuildModeWidgetPath = TEXT("/Game/FactoryGame/Interface/UI/InGame/BuildMenu/Widget_BuildMode.Widget_BuildMode_C");
+	const TCHAR* const ToggleKeyHint = TEXT("{TB.ToggleFollowTerrain}");
+	// Finding the widget walks every object, so a missing one is only looked for this often (s).
+	constexpr double BuildModeWidgetSearchInterval = 1.0;
+
+	struct FHintRow
+	{
+		FText Action;
+		FText KeyBinding;
+	};
+
+	TWeakObjectPtr<UUserWidget> BuildModeWidget;
+	double NextBuildModeWidgetSearch = 0.0;
+
+	// Blueprint struct members carry a generated suffix, so match on the start of their names.
+	bool FindHintRowFields(const FProperty* ArrayProperty, FTextProperty*& OutAction, FTextProperty*& OutKeyBinding)
+	{
+		const FArrayProperty* Array = CastField<FArrayProperty>(ArrayProperty);
+		const FStructProperty* Row = Array != nullptr ? CastField<FStructProperty>(Array->Inner) : nullptr;
+		OutAction = nullptr;
+		OutKeyBinding = nullptr;
+		if (Row == nullptr)
+		{
+			return false;
+		}
+		for (TFieldIterator<FTextProperty> It(Row->Struct); It; ++It)
+		{
+			if (It->GetName().StartsWith(TEXT("Action")))
+			{
+				OutAction = *It;
+			}
+			else if (It->GetName().StartsWith(TEXT("KeyBinding")))
+			{
+				OutKeyBinding = *It;
+			}
+		}
+		return OutAction != nullptr && OutKeyBinding != nullptr;
+	}
+
+	bool ReadHintRows(const UUserWidget* Widget, TArray<FHintRow>& OutRows)
+	{
+		const FArrayProperty* Array = FindFProperty<FArrayProperty>(Widget->GetClass(), TEXT("mCachedKeybinds"));
+		FTextProperty* Action;
+		FTextProperty* KeyBinding;
+		if (!FindHintRowFields(Array, Action, KeyBinding))
+		{
+			return false;
+		}
+		FScriptArrayHelper Rows(Array, Array->ContainerPtrToValuePtr<void>(Widget));
+		for (int32 Index = 0; Index < Rows.Num(); ++Index)
+		{
+			const uint8* Row = Rows.GetRawPtr(Index);
+			OutRows.Add({Action->GetPropertyValue_InContainer(Row), KeyBinding->GetPropertyValue_InContainer(Row)});
+		}
+		return true;
+	}
+
+	bool WriteHintRows(UUserWidget* Widget, const TArray<FHintRow>& Rows)
+	{
+		UFunction* Function = Widget->FindFunction(TEXT("SetKeybindingHints"));
+		FProperty* Param = nullptr;
+		if (Function != nullptr && Function->NumParms == 1)
+		{
+			Param = *TFieldIterator<FProperty>(Function);
+		}
+		FTextProperty* Action;
+		FTextProperty* KeyBinding;
+		if (Param == nullptr || !FindHintRowFields(Param, Action, KeyBinding))
+		{
+			if (FirstTime(TEXT("hint bar")))
+			{
+				UE_LOG(LogTerrainBelts, Warning, TEXT("%s has no usable SetKeybindingHints; the Follow Terrain key hint can't be shown"), *GetNameSafe(Widget->GetClass()));
+			}
+			return false;
+		}
+
+		uint8* Params = static_cast<uint8*>(FMemory_Alloca_Aligned(Function->ParmsSize, Function->GetMinAlignment()));
+		Function->InitializeStruct(Params);
+		FScriptArrayHelper Out(CastField<FArrayProperty>(Param), Param->ContainerPtrToValuePtr<void>(Params));
+		for (const FHintRow& Row : Rows)
+		{
+			uint8* Entry = Out.GetRawPtr(Out.AddValue());
+			Action->SetPropertyValue_InContainer(Entry, Row.Action);
+			KeyBinding->SetPropertyValue_InContainer(Entry, Row.KeyBinding);
+		}
+		Widget->ProcessEvent(Function, Params);
+		Function->DestroyStruct(Params);
+		return true;
+	}
+
+	bool IsShown(const UUserWidget* Widget)
+	{
+		const ESlateVisibility Visibility = Widget->GetVisibility();
+		return Widget->GetCachedWidget().IsValid() && Visibility != ESlateVisibility::Collapsed && Visibility != ESlateVisibility::Hidden;
+	}
+
+	UUserWidget* FindBuildModeWidget(const UWorld* World)
+	{
+		UUserWidget* Cached = BuildModeWidget.Get();
+		if (Cached != nullptr && Cached->GetWorld() == World && IsShown(Cached))
+		{
+			return Cached;
+		}
+		const double Now = FPlatformTime::Seconds();
+		if (Now < NextBuildModeWidgetSearch)
+		{
+			return nullptr;
+		}
+		NextBuildModeWidgetSearch = Now + BuildModeWidgetSearchInterval;
+
+		static UClass* WidgetClass = []
+		{
+			UClass* Loaded = LoadClass<UUserWidget>(nullptr, BuildModeWidgetPath);
+			if (Loaded != nullptr)
+			{
+				Loaded->AddToRoot();
+			}
+			return Loaded;
+		}();
+		if (WidgetClass == nullptr)
+		{
+			return nullptr;
+		}
+		for (TObjectIterator<UUserWidget> It(RF_ClassDefaultObject | RF_ArchetypeObject); It; ++It)
+		{
+			// Dismantle mode uses the same widget class.
+			if (It->GetClass() == WidgetClass && It->GetWorld() == World && IsShown(*It) && !It->GetName().Contains(TEXT("Dismantle")))
+			{
+				BuildModeWidget = *It;
+				return *It;
+			}
+		}
+		return nullptr;
+	}
+
+	// Shows "Follow Terrain: On/Off" with its key while placing a belt, pipe, hypertube or track,
+	// so the toggle's state is visible even on flat ground.
+	void UpdateKeyHint(AFGCharacterPlayer* Player)
+	{
+		const AFGBuildGun* BuildGun = Player->GetBuildGun();
+		const UFGBuildGunStateBuild* BuildState = BuildGun != nullptr && BuildGun->IsEquipped() ? Cast<UFGBuildGunStateBuild>(BuildGun->GetCurrentState()) : nullptr;
+		const AFGHologram* Hologram = BuildState != nullptr ? BuildState->GetHologram() : nullptr;
+		const bool bShow = Hologram != nullptr && Hologram->GetParentHologram() == nullptr &&
+			(Hologram->IsA<AFGConveyorBeltHologram>() || Hologram->IsA<AFGPipelineHologram>() || Hologram->IsA<AFGRailroadTrackHologram>());
+
+		// Only look for the widget while there's a hint to show; otherwise just clean up after it.
+		UUserWidget* Widget = bShow ? FindBuildModeWidget(Player->GetWorld()) : BuildModeWidget.Get();
+		TArray<FHintRow> Rows;
+		if (Widget == nullptr || !ReadHintRows(Widget, Rows))
+		{
+			return;
+		}
+		const int32 Ours = Rows.IndexOfByPredicate([](const FHintRow& Row) { return Row.KeyBinding.ToString() == ToggleKeyHint; });
+		if (bShow)
+		{
+			const FText Label = bFollowTerrainEnabled ? INVTEXT("Follow Terrain: On") : INVTEXT("Follow Terrain: Off");
+			if (Ours == INDEX_NONE)
+			{
+				Rows.Add({Label, FText::FromString(ToggleKeyHint)});
+			}
+			else if (!Rows[Ours].Action.EqualTo(Label))
+			{
+				Rows[Ours].Action = Label;
+			}
+			else
+			{
+				return;
+			}
+		}
+		else if (Ours != INDEX_NONE)
+		{
+			Rows.RemoveAt(Ours);
+		}
+		else
+		{
+			return;
+		}
+		WriteHintRows(Widget, Rows);
+	}
+}
+
+bool FTerrainBeltsModule::ShouldFollowTerrain(const AFGHologram* Hologram)
+{
+	using namespace TerrainBelts;
+
+	if (!bFollowTerrainEnabled || Hologram == nullptr)
+	{
+		return false;
+	}
+	// Rails have no build modes of their own.
+	if (Hologram->IsA<AFGRailroadTrackHologram>())
+	{
+		return true;
+	}
+
+	// Default, Straight and Curve keep their shape from above and only change height. Shape
+	// modes (pipe Noodle, 2D, Horizontal to Vertical) stay vanilla.
+	TArray<TSubclassOf<UFGHologramBuildModeDescriptor>, TInlineAllocator<4>> Modes{Hologram->GetDefaultBuildGunMode()};
+	if (const AFGConveyorBeltHologram* Belt = Cast<AFGConveyorBeltHologram>(Hologram))
+	{
+		Modes.Append({Belt->mBuildModeStraight, Belt->mBuildModeCurve});
+	}
+	else if (const AFGPipelineHologram* Pipe = Cast<AFGPipelineHologram>(Hologram))
+	{
+		Modes.Append({Pipe->mBuildModeAuto, Pipe->mBuildModeStraight, Pipe->mBuildModeCurve});
+	}
+	else
+	{
+		return false;
+	}
+	return Modes.ContainsByPredicate([Hologram](const TSubclassOf<UFGHologramBuildModeDescriptor>& Mode)
+	{
+		return Mode != nullptr && Hologram->IsCurrentBuildMode(Mode);
+	});
 }
 
 void FTerrainBeltsModule::SpawnAutoLiftChildren(AFGConveyorBeltHologram* Belt, AActor* HologramOwner, const FVector& SpawnLocation)
@@ -2565,18 +2836,20 @@ void FTerrainBeltsModule::RegisterHooks()
 {
 	using namespace TerrainBelts;
 
-	// Filter immediately after floor validation, before placement validity/materials are
-	// evaluated. Keep every other rejection, including our later pipe ground-clearance check.
+	// Filter after placement validation, before ValidatePlacementAndCost updates materials.
+	// Some CheckValidFloor overrides (notably FactoryBuilding) are empty in Shipping and
+	// too short for funchook to patch. Use the placement checks instead. Register this before
+	// our pipe ground-clearance hook below so its terrain-intersection rejection is retained.
 	const auto FilterUnevenFloor = [](AFGBuildableHologram* Hologram)
 	{
 		RemoveUnevenSurfaceDisqualifier(Hologram);
 	};
-	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGBuildableHologram, CheckValidFloor, FilterUnevenFloor);
-	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGFactoryBuildingHologram, CheckValidFloor, FilterUnevenFloor);
-	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGConveyorBeltHologram, CheckValidFloor, FilterUnevenFloor);
-	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGConveyorLiftHologram, CheckValidFloor, FilterUnevenFloor);
-	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGPipelineHologram, CheckValidFloor, FilterUnevenFloor);
-	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGRailroadTrackHologram, CheckValidFloor, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGBuildableHologram, CheckValidPlacement, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGFactoryBuildingHologram, CheckValidPlacement, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGConveyorBeltHologram, CheckValidPlacement, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGConveyorLiftHologram, CheckValidPlacement, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGPipelineHologram, CheckValidPlacement, FilterUnevenFloor);
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGRailroadTrackHologram, CheckValidPlacement, FilterUnevenFloor);
 
 	// Like Construction Preferences, change the placement limit after vanilla initializes it.
 	// Use the class default as the baseline so child holograms don't compound the multiplier.
@@ -2610,11 +2883,11 @@ void FTerrainBeltsModule::RegisterHooks()
 			Hologram->mMaxLength = BaseLength * GetLengthMultiplier(Hologram);
 		});
 
-	// Runs after vanilla GenerateAndUpdateSpline. In Follow Terrain, vanilla matches none of its
-	// own build modes and falls back to its default auto-route, which this drapes.
+	// Runs after vanilla GenerateAndUpdateSpline, and drapes whatever route the current build
+	// mode produced.
 	auto DrapeHologram = [](auto* Hologram, const TCHAR* Kind, const FDrapeSettings& Settings)
 	{
-		const bool bFollowTerrain = Hologram->IsCurrentBuildMode(UTerrainBeltsBuildMode::StaticClass());
+		const bool bFollowTerrain = ShouldFollowTerrain(Hologram);
 		if (FirstTime(*FString::Printf(TEXT("%s:%d"), Kind, bFollowTerrain)))
 		{
 			UE_LOG(LogTerrainBelts, Display, TEXT("%s GenerateAndUpdateSpline hook live (follow terrain: %s, %d points)"),
@@ -2639,36 +2912,15 @@ void FTerrainBeltsModule::RegisterHooks()
 		}
 	};
 
-	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGConveyorBeltHologram, GetSupportedBuildModes_Implementation,
-		[](const AFGConveyorBeltHologram* Hologram, TArray<TSubclassOf<UFGBuildGunModeDescriptor>>& OutBuildModes)
+	// The Follow Terrain key and its hint, updated each tick for the local player.
+	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGCharacterPlayer, Tick,
+		[](AFGCharacterPlayer* Player, float DeltaSeconds)
 		{
-			OutBuildModes.AddUnique(UTerrainBeltsBuildMode::StaticClass());
-			LogBuildModes(TEXT("belt"), Hologram, OutBuildModes.Num());
-		});
-
-	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGPipelineHologram, GetSupportedBuildModes_Implementation,
-		[](const AFGPipelineHologram* Hologram, TArray<TSubclassOf<UFGBuildGunModeDescriptor>>& OutBuildModes)
-		{
-			OutBuildModes.AddUnique(UTerrainBeltsBuildMode::StaticClass());
-			LogBuildModes(TEXT("pipe"), Hologram, OutBuildModes.Num());
-		});
-
-	// Rails don't override GetSupportedBuildModes, so hook the base. Belts and pipes call it too;
-	// they're skipped here and get the mode from their own hooks above.
-	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGHologram, GetSupportedBuildModes_Implementation,
-		[](const AFGHologram* Hologram, TArray<TSubclassOf<UFGBuildGunModeDescriptor>>& OutBuildModes)
-		{
-			if (!Hologram->IsA<AFGRailroadTrackHologram>())
+			if (Player->IsLocallyControlled())
 			{
-				return;
+				HandleInput(Player);
+				UpdateKeyHint(Player);
 			}
-			// With no modes of their own, rails need a vanilla entry to cycle back to.
-			if (OutBuildModes.IsEmpty())
-			{
-				OutBuildModes.Add(UTerrainBeltsDefaultBuildMode::StaticClass());
-			}
-			OutBuildModes.AddUnique(UTerrainBeltsBuildMode::StaticClass());
-			LogBuildModes(TEXT("rail"), Hologram, OutBuildModes.Num());
 		});
 
 	SUBSCRIBE_METHOD_AFTER(AFGConveyorBeltHologram::GenerateAndUpdateSpline,
@@ -2692,7 +2944,7 @@ void FTerrainBeltsModule::RegisterHooks()
 				.VerticalBendRadius = BeltVerticalBendRadius,
 				.bKeepLevelOnFlatGround = true,
 				.bEnforceIncline = true});
-			if (Hologram->IsCurrentBuildMode(UTerrainBeltsBuildMode::StaticClass()) && ApplyAutoLift(Hologram, Settings))
+			if (ShouldFollowTerrain(Hologram) && ApplyAutoLift(Hologram, Settings))
 			{
 				return;
 			}
@@ -2727,7 +2979,7 @@ void FTerrainBeltsModule::RegisterHooks()
 				.MinBendRadius = PipelineBendMargin * Hologram->mMinBendRadius,
 				.bKeepLevelOnFlatGround = true});
 
-			if (!Hologram->IsCurrentBuildMode(UTerrainBeltsBuildMode::StaticClass()))
+			if (!ShouldFollowTerrain(Hologram))
 			{
 				DrapeHologram(Hologram, Kind, Settings); // only logs that the hook is live
 				return;
@@ -2838,7 +3090,7 @@ void FTerrainBeltsModule::RegisterHooks()
 	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGPipelineHologram, CheckValidPlacement,
 		[](AFGPipelineHologram* Hologram)
 		{
-			if (Hologram->IsCurrentBuildMode(UTerrainBeltsBuildMode::StaticClass()) && PipelineGroundFailures.Contains(FObjectKey(Hologram)))
+			if (ShouldFollowTerrain(Hologram) && PipelineGroundFailures.Contains(FObjectKey(Hologram)))
 			{
 				Hologram->mConstructDisqualifiers.AddUnique(UFGCDInvalidFloor::StaticClass());
 			}
@@ -2873,7 +3125,7 @@ void FTerrainBeltsModule::RegisterHooks()
 		[DrapeHologram](AFGRailroadTrackHologram* Hologram, const FHitResult& HitResult)
 		{
 			const FObjectKey Key(Hologram);
-			if (!Hologram->IsCurrentBuildMode(UTerrainBeltsBuildMode::StaticClass()))
+			if (!ShouldFollowTerrain(Hologram))
 			{
 				RailSplines.Remove(Key);
 				DrapeHologram(Hologram, TEXT("rail"), (FDrapeSettings{.StepLength = RailStepLength, .GroundClearance = RailClearance, .MaxInclineDegrees = Hologram->mMaxGrade - RailGradeMarginDegrees, .SmoothingPasses = RailSmoothingPasses, .bOnlyRaise = true}));
@@ -2967,6 +3219,7 @@ void FTerrainBeltsModule::StartupModule()
 #if !WITH_EDITOR
 	// FactoryGame's editor build only has link stubs, too short for funchook to patch,
 	// so hooking there crashes the editor (and Alpakit's cook). Hooks only run in game.
+	TerrainBelts::RegisterChildInputContexts();
 	RegisterHooks();
 #endif
 }

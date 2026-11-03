@@ -27,6 +27,7 @@ private:
 	// RegisterHooks share that access.
 	static void RegisterHooks();
 	static void RemoveUnevenSurfaceDisqualifier(AFGBuildableHologram* Hologram);
+	static bool ShouldFollowTerrain(const AFGHologram* Hologram);
 
 	// Auto-lift: in Follow Terrain, a belt that meets a cliff too steep for it is split into
 	// belt -> lift -> belt, using a lift and a second belt spawned as disabled children.
