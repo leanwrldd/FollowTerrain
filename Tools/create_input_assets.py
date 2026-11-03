@@ -10,13 +10,15 @@ CHORD_ALT = "/Game/FactoryGame/Inputs/IA_ChordAlt"
 
 tools = unreal.AssetToolsHelpers.get_asset_tools()
 lib = unreal.EditorAssetLibrary
+# A commandlet hasn't scanned plugin content yet, so the registry wouldn't know the assets exist
+# and create_asset would refuse to overwrite them.
+unreal.AssetRegistryHelpers.get_asset_registry().scan_paths_synchronous([ROOT], True)
 
 
 def get_or_create(name, cls):
     path = f"{ROOT}/{name}"
-    if lib.does_asset_exist(path):
-        asset = lib.load_asset(path)
-    else:
+    asset = lib.load_asset(path) if lib.does_asset_exist(path) else unreal.load_object(None, f"{path}.{name}")
+    if asset is None:
         factory = unreal.DataAssetFactory()
         factory.set_editor_property("data_asset_class", cls)
         asset = tools.create_asset(name, ROOT, cls, factory)
@@ -57,7 +59,11 @@ pressed = unreal.new_object(unreal.InputTriggerPressed, outer=keybinds)
 # replaces, so a player rebind doesn't keep a stray Alt requirement. Chorded mappings also win over
 # plain T (Hide HUD) while Alt is held.
 alt = unreal.new_object(unreal.InputTriggerChordAction, outer=keybinds)
-alt.set_editor_property("chord_action", unreal.load_asset(CHORD_ALT))
+# EditInstanceOnly, so set_editor_property refuses it on an asset's subobject; it's also
+# BlueprintReadWrite, which plain attribute access goes by.
+alt.chord_action = unreal.load_asset(CHORD_ALT)
+if alt.chord_action is None:
+    raise RuntimeError(f"Could not load {CHORD_ALT}")
 keybinds.set_editor_property("mappings", [
     make_mapping(keybinds, toggle, "T", [pressed, alt], "TB.ToggleFollowTerrain", "Toggle Follow Terrain"),
 ])
