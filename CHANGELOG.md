@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0
+
+### Changed
+- **Allow uneven surfaces is now on by default.**
+
+### Added
+- Mod icon, shown in the in-game mod list.
+
+### Fixed
+- Fixed a possible memory overrun when filling the build gun key hint bar (Follow Terrain: On/Off row).
+
 ## 1.1.0
 
 ### Changed

@@ -2046,6 +2046,10 @@ namespace TerrainBelts
 		if (Function != nullptr && Function->NumParms == 1)
 		{
 			Param = *TFieldIterator<FProperty>(Function);
+			if (Param != nullptr && (!Param->HasAnyPropertyFlags(CPF_Parm) || !Param->IsInContainer(Function->ParmsSize)))
+			{
+				Param = nullptr;
+			}
 		}
 		FTextProperty* Action;
 		FTextProperty* KeyBinding;
@@ -2058,8 +2062,11 @@ namespace TerrainBelts
 			return false;
 		}
 
+		// Only the parameter block: UFunction::InitializeStruct would also construct the
+		// Blueprint's local variables, which lie past ParmsSize, and overrun the buffer.
 		uint8* Params = static_cast<uint8*>(FMemory_Alloca_Aligned(Function->ParmsSize, Function->GetMinAlignment()));
-		Function->InitializeStruct(Params);
+		FMemory::Memzero(Params, Function->ParmsSize);
+		Param->InitializeValue_InContainer(Params);
 		FScriptArrayHelper Out(CastField<FArrayProperty>(Param), Param->ContainerPtrToValuePtr<void>(Params));
 		for (const FHintRow& Row : Rows)
 		{
@@ -2068,7 +2075,7 @@ namespace TerrainBelts
 			KeyBinding->SetPropertyValue_InContainer(Entry, Row.KeyBinding);
 		}
 		Widget->ProcessEvent(Function, Params);
-		Function->DestroyStruct(Params);
+		Param->DestroyValue_InContainer(Params);
 		return true;
 	}
 

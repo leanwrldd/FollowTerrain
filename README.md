@@ -47,7 +47,7 @@ Open **Mods → Terrain Belts → settings** to configure:
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| **Allow uneven surfaces** | Off | Removes the uneven-surface placement restriction immediately, including during an active placement. |
+| **Allow uneven surfaces** | On | Removes the uneven-surface placement restriction immediately, including during an active placement. |
 | **Maximum length multiplier** | 8× | Adjusts maximum segment length and conveyor lift height from 1–32×. Applies when you start a new placement. |
 
 Allowing uneven surfaces keeps the other placement checks, including slope, curvature, snapping,

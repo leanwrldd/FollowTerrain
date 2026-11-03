@@ -21,7 +21,7 @@ namespace TerrainBelts
 		const UConfigPropertySection* Root = Manager != nullptr ? Manager->GetConfigurationRootSection(Id) : nullptr;
 		const UConfigPropertyBool* Property = Root != nullptr
 			? Cast<UConfigPropertyBool>(Root->SectionProperties.FindRef(AllowUnevenSurfacesPropertyName)) : nullptr;
-		return Property != nullptr && Property->Value;
+		return Property == nullptr || Property->Value;
 	}
 
 	float GetLengthMultiplier(const AActor* Hologram)
@@ -80,8 +80,8 @@ UTerrainBeltsConfiguration::UTerrainBeltsConfiguration(const FObjectInitializer&
 	UConfigPropertyBool* UnevenSurfaces = NewObject<UConfigPropertyBool>(Root, BoolClass, AllowUnevenSurfacesPropertyName);
 	UnevenSurfaces->DisplayName = FText::FromString(TEXT("Allow uneven surfaces"));
 	UnevenSurfaces->Tooltip = FText::FromString(TEXT("Removes the surface-too-uneven restriction for belts, pipelines, hypertubes, railway tracks and their supports in all build modes. Other placement checks still apply. Takes effect immediately. Use the same setting on every player and server in multiplayer."));
-	UnevenSurfaces->DefaultValue = false;
-	UnevenSurfaces->Value = false;
+	UnevenSurfaces->DefaultValue = true;
+	UnevenSurfaces->Value = true;
 	UnevenSurfaces->bRequiresWorldReload = false;
 	Root->SectionProperties.Add(AllowUnevenSurfacesPropertyName, UnevenSurfaces);
 }
