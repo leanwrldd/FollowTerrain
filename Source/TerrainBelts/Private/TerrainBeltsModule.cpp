@@ -269,6 +269,12 @@ namespace TerrainBelts
 	};
 	TMap<FObjectKey, FBuiltSplit> BuiltSplits;
 
+	// Construction Preferences, with its conveyor pole type set to none, destroys on the next tick
+	// whatever a child of a belt hologram builds, assuming every child is a pole. While the main
+	// belt constructs, our split children are detached from it so that check skips them; this maps
+	// each detached child to its main belt for the code that still needs it.
+	TMap<FObjectKey, TWeakObjectPtr<AFGConveyorBeltHologram>> DetachedSplitChildren;
+
 	// Vanilla rail GenerateAndUpdateSpline only writes mSplineData[0] and [1] in place and never
 	// resizes the array (seen in the 1.2 disassembly), unlike belts. Run on a draped spline, it
 	// moves the end into slot 1 and keeps the stale draped tail, which the next drape subdivides
@@ -376,8 +382,10 @@ namespace TerrainBelts
 	}
 
 	// Highest ground under the centre line and HalfWidth to either side of it. Across is the
-	// horizontal unit vector at right angles to the spline.
-	bool FindGroundZAcross(const UWorld* World, const AActor* Hologram, const FVector2D& Center, const FVector2D& Across, double HalfWidth, double Top, double Bottom, double MaxBuildingZ, double& OutZ)
+	// horizontal unit vector at right angles to the spline. SplineZ is the spline's own height
+	// there: a building the side traces find above it is one the spline runs alongside (a
+	// foundation wall), not under, so they look past it for the ground below.
+	bool FindGroundZAcross(const UWorld* World, const AActor* Hologram, const FVector2D& Center, const FVector2D& Across, double HalfWidth, double Top, double Bottom, double MaxBuildingZ, double SplineZ, double& OutZ)
 	{
 		bool bFound = FindGroundZ(World, Hologram, Center, Top, Bottom, MaxBuildingZ, OutZ);
 		if (HalfWidth <= 0.0 || Across.IsNearlyZero())
@@ -387,7 +395,7 @@ namespace TerrainBelts
 		for (const double Side : {-HalfWidth, HalfWidth})
 		{
 			double SideZ;
-			if (FindGroundZ(World, Hologram, Center + Across * Side, Top, Bottom, MaxBuildingZ, SideZ))
+			if (FindGroundZ(World, Hologram, Center + Across * Side, Top, Bottom, FMath::Min(MaxBuildingZ, SplineZ), SideZ))
 			{
 				OutZ = bFound ? FMath::Max(OutZ, SideZ) : SideZ;
 				bFound = true;
@@ -549,6 +557,7 @@ namespace TerrainBelts
 		TArray<double> MinZ; // ground + clearance; the ends keep their own height
 		TArray<FGroundSample> Samples;
 		double MaxSlope = 0.0;
+		bool bFoundGround = false; // at any interior point or sample
 	};
 
 	// The samples of segments [FirstSegment, FirstSegment + NumSegments), renumbered from 0, for
@@ -681,9 +690,9 @@ namespace TerrainBelts
 			const FSplinePointData& Point = Out.Points[Index];
 			const double Bottom = FMath::Min3(StartZ, EndZ, Point.Location.Z) - TraceSearchDistance;
 			double GroundZ;
-			Out.MinZ[Index] = FindGroundZAcross(World, Hologram, FVector2D(Point.Location), AcrossDirection(Point.LeaveTangent), Settings.HalfWidth, TraceTop(Out.Along[Index]), Bottom, MaxBuildingZ, GroundZ)
-				? GroundZ + Settings.GroundClearance
-				: Point.Location.Z;
+			const bool bFound = FindGroundZAcross(World, Hologram, FVector2D(Point.Location), AcrossDirection(Point.LeaveTangent), Settings.HalfWidth, TraceTop(Out.Along[Index]), Bottom, MaxBuildingZ, Point.Location.Z, GroundZ);
+			Out.MinZ[Index] = bFound ? GroundZ + Settings.GroundClearance : Point.Location.Z;
+			Out.bFoundGround |= bFound;
 		}
 
 		Out.Samples.Reset();
@@ -701,9 +710,10 @@ namespace TerrainBelts
 					const FVector Tangent = FMath::CubicInterpDerivative(A.Location, A.LeaveTangent, B.Location, B.ArriveTangent, T);
 					const double Bottom = FMath::Min3(StartZ, EndZ, Location.Z) - TraceSearchDistance;
 					double GroundZ;
-					if (FindGroundZAcross(World, Hologram, FVector2D(Location), AcrossDirection(Tangent), Settings.HalfWidth, TraceTop(Out.Along[Segment] + T * Out.Step[Segment]), Bottom, MaxBuildingZ, GroundZ))
+					if (FindGroundZAcross(World, Hologram, FVector2D(Location), AcrossDirection(Tangent), Settings.HalfWidth, TraceTop(Out.Along[Segment] + T * Out.Step[Segment]), Bottom, MaxBuildingZ, Location.Z, GroundZ))
 					{
 						Out.Samples.Add({Segment, T, GroundZ + Settings.GroundClearance});
+						Out.bFoundGround = true;
 					}
 				}
 			}
@@ -1141,6 +1151,17 @@ namespace TerrainBelts
 		{
 			return false;
 		}
+		// No ground under any of it: nothing to follow. Draping would only smooth and round the
+		// vanilla curve upwards (heights never drop below vanilla's where there's no ground),
+		// turning a clean S-curve over a gap into a wavier, higher one.
+		if (!Profile.bFoundGround)
+		{
+			if (FirstTime(TEXT("no ground")))
+			{
+				UE_LOG(LogTerrainBelts, Display, TEXT("No ground under the spline; keeping vanilla's shape"));
+			}
+			return true;
+		}
 		TArray<double> MinZ = Profile.MinZ;
 		TArray<FGroundSample> Samples = Profile.Samples;
 		if (Settings.bKeepLevelOnFlatGround && ShouldKeepLevelOnFlatGround(Profile))
@@ -1174,7 +1195,10 @@ namespace TerrainBelts
 
 	// Sweep the pipe's volume along the final Hermite curve, including steps and the vanilla
 	// fallback. A downward ground trace cannot distinguish a solid floor from open space under it.
-	bool HasPipelineGroundClearance(const TArray<FSplinePointData>& SplineData, const AActor* Hologram, const FDrapeSettings& Settings)
+	// bIgnoreBuildings lets foundations and other buildings through: vanilla's own route may clip
+	// those (with only a clearance warning), so only terrain is held against it.
+	bool HasPipelineGroundClearance(const TArray<FSplinePointData>& SplineData, const AActor* Hologram, const FDrapeSettings& Settings,
+		bool bIgnoreBuildings = false)
 	{
 		const TArray<FSplinePointData> Points = ToWorldPoints(SplineData, Hologram->GetActorTransform());
 		const UWorld* World = Hologram->GetWorld();
@@ -1186,6 +1210,7 @@ namespace TerrainBelts
 		{
 			TArray<FSplinePointData> Points;
 			double Time;
+			bool bIgnoreBuildings;
 			bool bClear;
 		};
 		static TMap<FObjectKey, TArray<FCachedCheck>> Checks;
@@ -1196,7 +1221,7 @@ namespace TerrainBelts
 			for (const FCachedCheck& Check : *Cached)
 			{
 				// Refresh even an unchanged route so newly placed/dismantled foundations count.
-				if (Now - Check.Time < 0.25 && SameSplineData(Check.Points, Points))
+				if (Now - Check.Time < 0.25 && Check.bIgnoreBuildings == bIgnoreBuildings && SameSplineData(Check.Points, Points))
 				{
 					return Check.bClear;
 				}
@@ -1224,7 +1249,8 @@ namespace TerrainBelts
 					{
 						break;
 					}
-					if (!ShouldSkipGroundHit(Hit) || Attempt == MaxSkippedHits)
+					const bool bSkip = ShouldSkipGroundHit(Hit) || (bIgnoreBuildings && IsInstancedBuildingHit(Hit));
+					if (!bSkip || Attempt == MaxSkippedHits)
 					{
 						bClear = false;
 						if (FirstTime(TEXT("pipe:ground-obstruction")))
@@ -1248,7 +1274,7 @@ namespace TerrainBelts
 		{
 			Entries.RemoveAt(0);
 		}
-		Entries.Add({Points, Now, bClear});
+		Entries.Add({Points, Now, bIgnoreBuildings, bClear});
 		return bClear;
 	}
 
@@ -2727,7 +2753,15 @@ void FTerrainBeltsModule::ConnectBuiltPieces(const AFGHologram* Hologram, AFGBui
 	const AFGHologram* MainBelt = nullptr;
 	bool bIsLift = false;
 	int32 Index = 0;
-	if (const AFGConveyorBeltHologram* Parent = Cast<AFGConveyorBeltHologram>(Hologram->GetParentHologram()))
+	const AFGHologram* ParentHologram = Hologram->GetParentHologram();
+	if (ParentHologram == nullptr)
+	{
+		if (const TWeakObjectPtr<AFGConveyorBeltHologram>* Detached = DetachedSplitChildren.Find(FObjectKey(Hologram)))
+		{
+			ParentHologram = Detached->Get();
+		}
+	}
+	if (const AFGConveyorBeltHologram* Parent = Cast<AFGConveyorBeltHologram>(ParentHologram))
 	{
 		if (!FindAutoLiftChild(Parent, Hologram, bIsLift, Index))
 		{
@@ -2802,9 +2836,17 @@ void FTerrainBeltsModule::ConnectBuiltPieces(const AFGHologram* Hologram, AFGBui
 
 void FTerrainBeltsModule::RemoveUnevenSurfaceDisqualifier(AFGBuildableHologram* Hologram)
 {
+	if (IsExemptFromUnevenFloor(Hologram))
+	{
+		Hologram->mConstructDisqualifiers.Remove(UFGCDInvalidFloor::StaticClass());
+	}
+}
+
+bool FTerrainBeltsModule::IsExemptFromUnevenFloor(const AFGHologram* Hologram)
+{
 	if (!TerrainBelts::AllowUnevenSurfaces(Hologram))
 	{
-		return;
+		return false;
 	}
 	// Restrict standalone supports as well as child supports; power poles and unrelated
 	// buildings keep their normal floor checks.
@@ -2833,10 +2875,7 @@ void FTerrainBeltsModule::RemoveUnevenSurfaceDisqualifier(AFGBuildableHologram* 
 		Hologram->IsA<AFGConveyorMultiPoleHologram>() || Hologram->IsA<AFGPipelinePoleHologram>() || bAttachmentSupport ||
 		(BuildClass != nullptr && (BuildClass->IsChildOf(AFGBuildablePoleConveyor::StaticClass()) ||
 			BuildClass->IsChildOf(AFGBuildablePoleStackable::StaticClass())));
-	if (bSplineOrSupport)
-	{
-		Hologram->mConstructDisqualifiers.Remove(UFGCDInvalidFloor::StaticClass());
-	}
+	return bSplineOrSupport;
 }
 
 void FTerrainBeltsModule::RegisterHooks()
@@ -2851,6 +2890,20 @@ void FTerrainBeltsModule::RegisterHooks()
 	{
 		RemoveUnevenSurfaceDisqualifier(Hologram);
 	};
+	// Also refuse the disqualifier wherever it's added: some holograms (or their children) add it
+	// after CheckValidPlacement, which the filter above never sees.
+	SUBSCRIBE_METHOD(AFGHologram::AddConstructDisqualifier,
+		[](auto& Scope, AFGHologram* Hologram, TSubclassOf<UFGConstructDisqualifier> Disqualifier)
+		{
+			if (Disqualifier == UFGCDInvalidFloor::StaticClass() && IsExemptFromUnevenFloor(Hologram))
+			{
+				if (FirstTime(*FString::Printf(TEXT("uneven:%s"), *GetNameSafe(Hologram->GetClass()))))
+				{
+					UE_LOG(LogTerrainBelts, Display, TEXT("Blocked surface-too-uneven on %s"), *GetNameSafe(Hologram->GetClass()));
+				}
+				Scope.Cancel();
+			}
+		});
 	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGBuildableHologram, CheckValidPlacement, FilterUnevenFloor);
 	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGFactoryBuildingHologram, CheckValidPlacement, FilterUnevenFloor);
 	SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGConveyorBeltHologram, CheckValidPlacement, FilterUnevenFloor);
@@ -3023,12 +3076,30 @@ void FTerrainBeltsModule::RegisterHooks()
 					Level(Leveled.Last().ArriveTangent);
 				}
 			}
+			// The plain drape resamples the whole spline into steps and smooths it, which smears a
+			// vertical end's tight elbow into a wide swoop that bulges out under the riser. A pipe
+			// with a vertical end that neither vertical-end shape fits keeps vanilla's spline.
+			bool bHasVerticalEnd = false;
+			if (Leveled.Num() >= 2)
+			{
+				const FTransform& ToWorld = Hologram->GetActorTransform();
+				auto IsVertical = [&ToWorld](const FVector& Tangent) { return FMath::Abs(ToWorld.TransformVector(Tangent).GetSafeNormal().Z) > 0.7; };
+				bHasVerticalEnd = IsVertical(Leveled[0].LeaveTangent) || IsVertical(Leveled.Last().ArriveTangent);
+			}
 			constexpr int32 AttemptStep = 0; // then 1: drape between vertical ends
 			constexpr int32 AttemptPlainDrape = 2;
 			auto Shape = [&](int32 Attempt) -> bool
 			{
 				Hologram->mSplineData = Leveled;
 				bool bShaped;
+				if (Attempt == AttemptPlainDrape && bHasVerticalEnd)
+				{
+					if (FirstTime(*FString::Printf(TEXT("%s:no plain drape"), Kind)))
+					{
+						UE_LOG(LogTerrainBelts, Display, TEXT("%s with a vertical end fits no vertical-end shape; keeping vanilla's spline"), Kind);
+					}
+					return false;
+				}
 				if (Attempt == AttemptPlainDrape)
 				{
 					bShaped = DrapeSpline(Hologram->mSplineData, Hologram, Settings);
@@ -3068,7 +3139,19 @@ void FTerrainBeltsModule::RegisterHooks()
 						}
 					}
 				}
-				return Fault <= 0.0f && HasPipelineGroundClearance(Hologram->mSplineData, Hologram, Settings);
+				if (Fault > 0.0f)
+				{
+					return false;
+				}
+				if (!HasPipelineGroundClearance(Hologram->mSplineData, Hologram, Settings))
+				{
+					if (FirstTime(*FString::Printf(TEXT("%s:clearance:%d"), Kind, Attempt)))
+					{
+						UE_LOG(LogTerrainBelts, Display, TEXT("%s shape %d hits the ground or a building; trying a simpler shape"), Kind, Attempt);
+					}
+					return false;
+				}
+				return true;
 			};
 			for (int32 Attempt = AttemptStep; Attempt <= AttemptPlainDrape; ++Attempt)
 			{
@@ -3084,7 +3167,7 @@ void FTerrainBeltsModule::RegisterHooks()
 			}
 			Hologram->mSplineData = Vanilla;
 			Hologram->UpdateSplineComponent();
-			if (!HasPipelineGroundClearance(Vanilla, Hologram, Settings))
+			if (!HasPipelineGroundClearance(Vanilla, Hologram, Settings, true))
 			{
 				if (PipelineGroundFailures.Num() >= MaxProfileCacheHolograms)
 				{
@@ -3182,6 +3265,50 @@ void FTerrainBeltsModule::RegisterHooks()
 		{
 			ConnectBuiltPieces(Hologram, Buildable);
 		});
+
+	// The main belt constructs its children inside its own Construct. Detach our split pieces for
+	// that call so Construction Preferences doesn't take them for poles (see DetachedSplitChildren).
+	// It reads the parent before the child builds, so this works whichever hook runs first.
+	// Parenthesized: the braced list below has a comma the macro would split on.
+	SUBSCRIBE_UOBJECT_METHOD(AFGBuildableHologram, Construct,
+		([](auto& Scope, AFGBuildableHologram* Hologram, TArray<AActor*>& OutChildren, FNetConstructionID ConstructionID)
+		{
+			AFGConveyorBeltHologram* Belt = Cast<AFGConveyorBeltHologram>(Hologram);
+			if (Belt == nullptr || Belt->GetParentHologram() != nullptr || NumActiveLifts(Belt) == 0)
+			{
+				return;
+			}
+
+			TArray<AFGHologram*, TInlineAllocator<2 * MaxAutoLifts>> Detached;
+			for (int32 Index = 0; Index < MaxAutoLifts; ++Index)
+			{
+				for (const FName Name : {LiftChildName(Index), BeltChildName(Index)})
+				{
+					AFGHologram* Child = Belt->FindChildHologramByName(Name);
+					if (Child != nullptr && !Child->IsDisabled() && Child->mParent == Belt)
+					{
+						Child->mParent = nullptr;
+						DetachedSplitChildren.Add(FObjectKey(Child), Belt);
+						Detached.Add(Child);
+					}
+				}
+			}
+
+			Scope(Hologram, OutChildren, ConstructionID);
+
+			for (AFGHologram* Child : Detached)
+			{
+				DetachedSplitChildren.Remove(FObjectKey(Child));
+				if (IsValid(Child))
+				{
+					Child->mParent = Belt;
+				}
+			}
+			if (FirstTime(TEXT("detach split")))
+			{
+				UE_LOG(LogTerrainBelts, Display, TEXT("Auto-lift: built %d split piece(s) detached from %s"), Detached.Num(), *GetNameSafe(Belt));
+			}
+		}));
 
 	// Our lift stands at the foot of a cliff wherever the ground is; vanilla's floor check would
 	// call it "too uneven".

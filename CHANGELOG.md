@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.2
+
+### Fixed
+- A pipe ending in a vertical riser (for example Straight mode into a floor hole) could get a
+  wide, bulging elbow with Follow Terrain on. It now keeps vanilla's tight bend when the terrain
+  shape doesn't fit.
+- A pipe with no ground under it (over a gap or between floors) came out wavier and higher than
+  vanilla's with Follow Terrain on. With nothing to follow, it now keeps vanilla's shape.
+- Belts and pipes running alongside a foundation wall were lifted as if the foundation's top were
+  ground under them, turning the curve into a stiff climb.
+- "Surface is too uneven" could still show on pipes and their supports with Allow uneven surfaces
+  on, when the game raised it outside the placement check the mod filtered.
+- With Follow Terrain on, a pipe whose route clipped a foundation (for example running from the
+  top of a foundation down its side) was blocked with "Surface is too uneven". Vanilla allows it
+  with a clearance warning, and now so does the mod. Pipes running into terrain are still blocked.
+
+## 1.2.1
+
+### Fixed
+- Lifts placed automatically on steep ground were removed right after building when Construction
+  Preferences is installed with its conveyor pole type set to none. It deleted every part built
+  alongside a belt, taking them all for poles. The belt pieces stayed, but the lifts were gone.
+
 ## 1.2.0
 
 ### Changed
