@@ -85,6 +85,11 @@ namespace TerrainBelts
 		// GroundClearance between the supports.
 		bool bKeepLevelOnFlatGround = false;
 
+		// A vanilla route that stays clear of the ground and never floats more than this above
+		// ground + GroundClearance (cm) is kept as it is: dragging a short belt between two machine
+		// ports down towards an uneven floor only bent it. 0 always drapes.
+		double MaxKeptFloat = 0.0;
+
 		// Never go below the vanilla spline, only over ground that pokes above it (rails: a
 		// straight grade is what you want, not one that dips into every hollow).
 		bool bOnlyRaise = false;
@@ -97,6 +102,7 @@ namespace TerrainBelts
 	// don't land exactly on the validation limit.
 	constexpr double BeltStepLength = 400.0;
 	constexpr double BeltClearance = 50.0;
+	constexpr double BeltMaxKeptFloat = 150.0; // a belt up to ~2 m above the ground keeps vanilla's shape
 	constexpr double BeltInclineMarginDegrees = 1.0;
 	constexpr int32 BeltSmoothingPasses = 1;
 	constexpr double BeltHalfWidth = 60.0;
@@ -175,6 +181,19 @@ namespace TerrainBelts
 
 	// Give up looking for ground after skipping this many buildables, holograms and foliage.
 	constexpr int32 MaxSkippedHits = 8;
+
+	// Ground found more than OverhangMinRise above the route (cm) may be the top of an overhang
+	// (a rock arch, a cave roof) with open floor under it. A floor below counts only with at
+	// least OverhangMinHeadroom of open space above it, and up to OverhangMaxLayers surfaces are
+	// looked through. The route's own height is also probed from OverhangProbeHeight above it.
+	constexpr double OverhangMinRise = 300.0;
+	constexpr double OverhangMinHeadroom = 400.0;
+	constexpr int32 OverhangMaxLayers = 3;
+	constexpr double OverhangProbeHeight = 200.0;
+	// Passing over an overhang must climb at least this much less (cm) than passing under it, or
+	// the line goes under. Rock tops are uneven and narrow, so a lift down at the start and up at
+	// the end over open floor beats riding the rock.
+	constexpr double OverhangClimbTolerance = 300.0;
 
 	// Points closer than this horizontally to the previous one (cm) are dropped. Vertical runs
 	// in a vanilla route (pipes climbing to an elevated end) would otherwise collapse onto one
@@ -336,13 +355,10 @@ namespace TerrainBelts
 		return ClassName.Contains(TEXT("AbstractInstanceManager")) || ClassName.Contains(TEXT("LightweightBuildable"));
 	}
 
-	// Satisfactory's mountains are mostly static-mesh cliffs, not landscape, so anything static
-	// counts as ground except buildable actors, holograms and foliage (which building clears anyway).
-	// Foundations and the like count only up to MaxBuildingZ: a floor the spline is being built on
-	// is ground, a platform well above both ends is something to pass under.
-	bool FindGroundZ(const UWorld* World, const AActor* Hologram, const FVector2D& XY, double Top, double Bottom, double MaxBuildingZ, double& OutZ)
+	// First surface counting as ground on the way down from Top to Bottom. Params gathers the
+	// skipped hits, so a caller can add more to ignore and trace again.
+	bool TraceGround(const UWorld* World, const FVector2D& XY, double Top, double Bottom, double MaxBuildingZ, FCollisionQueryParams& Params, FHitResult& OutHit)
 	{
-		FCollisionQueryParams Params(SCENE_QUERY_STAT(TerrainBeltsGround), false, Hologram);
 		const FCollisionObjectQueryParams ObjectParams(ECC_WorldStatic);
 		const FVector Start(XY, Top);
 		const FVector End(XY, Bottom);
@@ -363,7 +379,7 @@ namespace TerrainBelts
 			const bool bSkipActor = ShouldSkipGroundHit(Hit);
 			if (!bSkipActor && !(bInstancedBuilding && Hit.ImpactPoint.Z > MaxBuildingZ))
 			{
-				OutZ = Hit.ImpactPoint.Z;
+				OutHit = Hit;
 				return true;
 			}
 			// A buildable can have several collision components (a pipe floor hole has a few);
@@ -381,27 +397,201 @@ namespace TerrainBelts
 		return false;
 	}
 
+	// Whether a floor at FloorZ has open space above it: straight up from it, the first thing met
+	// is the underside of something (facing down) at least OverhangMinHeadroom higher. A trace
+	// starting inside a rock finds nothing, or a face pointing up, so ground buried in a hill
+	// doesn't count.
+	bool HasOpenSpaceAbove(const UWorld* World, const AActor* Hologram, const FVector2D& XY, double FloorZ, double TopZ)
+	{
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TerrainBeltsOverhang), false, Hologram);
+		const FCollisionObjectQueryParams ObjectParams(ECC_WorldStatic);
+		const FVector Start(XY, FloorZ + 5.0);
+		const FVector End(XY, TopZ);
+		for (int32 Attempt = 0; Attempt <= MaxSkippedHits; ++Attempt)
+		{
+			FHitResult Hit;
+			if (!World->LineTraceSingleByObjectType(Hit, Start, End, ObjectParams, Params))
+			{
+				return false;
+			}
+			if (ShouldSkipGroundHit(Hit) && Hit.GetActor() != nullptr)
+			{
+				Params.AddIgnoredActor(Hit.GetActor());
+				continue;
+			}
+			return !Hit.bStartPenetrating && Hit.ImpactNormal.Z < -0.1 && Hit.ImpactPoint.Z - FloorZ >= OverhangMinHeadroom;
+		}
+		return false;
+	}
+
+	// Satisfactory's mountains are mostly static-mesh cliffs, not landscape, so anything static
+	// counts as ground except buildable actors, holograms and foliage (which building clears anyway).
+	// Foundations and the like count only up to MaxBuildingZ: a floor the spline is being built on
+	// is ground, a platform well above both ends is something to pass under.
+	// OutZ is the top surface. With OutUnderZ and RouteZ (the spline's own height there), ground
+	// well above the route may be the top of an overhang (a rock arch, a cave roof): then OutUnderZ
+	// gets the open floor under it nearest the route, if there is one. Whether to pass over or
+	// under is decided for the whole overhang at once (ChooseOverOrUnder), not here.
+	bool FindGroundZ(const UWorld* World, const AActor* Hologram, const FVector2D& XY, double Top, double Bottom, double MaxBuildingZ, double& OutZ,
+		TOptional<double> RouteZ = {}, TOptional<double>* OutUnderZ = nullptr)
+	{
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TerrainBeltsGround), false, Hologram);
+		FHitResult Hit;
+		if (!TraceGround(World, XY, Top, Bottom, MaxBuildingZ, Params, Hit))
+		{
+			return false;
+		}
+		OutZ = Hit.ImpactPoint.Z;
+		if (OutUnderZ == nullptr || !RouteZ.IsSet() || OutZ <= *RouteZ + OverhangMinRise)
+		{
+			return true;
+		}
+
+		const double TopZ = OutZ;
+		TOptional<double> BestZ;
+		auto Consider = [&](const FHitResult& Floor)
+		{
+			const double FloorZ = Floor.ImpactPoint.Z;
+			if (!Floor.bStartPenetrating && Floor.ImpactNormal.Z > 0.1 && FloorZ < TopZ - OverhangMinHeadroom &&
+				(!BestZ.IsSet() || FMath::Abs(FloorZ - *RouteZ) < FMath::Abs(*BestZ - *RouteZ)) && HasOpenSpaceAbove(World, Hologram, XY, FloorZ, TopZ))
+			{
+				BestZ = FloorZ;
+			}
+		};
+
+		// Look through the surface found, and the next few, to whatever lies under them.
+		FCollisionQueryParams LayerParams = Params;
+		FHitResult Layer = Hit;
+		for (int32 Index = 0; Index < OverhangMaxLayers && Layer.GetComponent() != nullptr; ++Index)
+		{
+			LayerParams.AddIgnoredComponent(Layer.GetComponent());
+			if (!TraceGround(World, XY, Top, Bottom, MaxBuildingZ, LayerParams, Layer))
+			{
+				break;
+			}
+			Consider(Layer);
+		}
+		// The route may run through the open space under the overhang. A trace from just above it
+		// finds that floor even when the overhang and the floor are one mesh.
+		const double ProbeTop = *RouteZ + OverhangProbeHeight;
+		FCollisionQueryParams ProbeParams(SCENE_QUERY_STAT(TerrainBeltsGround), false, Hologram);
+		FHitResult Probe;
+		if (ProbeTop < TopZ && TraceGround(World, XY, ProbeTop, Bottom, MaxBuildingZ, ProbeParams, Probe))
+		{
+			Consider(Probe);
+		}
+
+		*OutUnderZ = BestZ;
+		return true;
+	}
+
 	// Highest ground under the centre line and HalfWidth to either side of it. Across is the
 	// horizontal unit vector at right angles to the spline. SplineZ is the spline's own height
 	// there: a building the side traces find above it is one the spline runs alongside (a
-	// foundation wall), not under, so they look past it for the ground below.
-	bool FindGroundZAcross(const UWorld* World, const AActor* Hologram, const FVector2D& Center, const FVector2D& Across, double HalfWidth, double Top, double Bottom, double MaxBuildingZ, double SplineZ, double& OutZ)
+	// foundation wall), not under, so they look past it for the ground below. OutUnderZ is the
+	// highest ground under any overhang there (see FindGroundZ); a trace with no overhang counts
+	// with its own ground, and if no trace found an overhang it stays unset.
+	bool FindGroundZAcross(const UWorld* World, const AActor* Hologram, const FVector2D& Center, const FVector2D& Across, double HalfWidth, double Top, double Bottom, double MaxBuildingZ, double SplineZ, double& OutZ, TOptional<double>& OutUnderZ)
 	{
-		bool bFound = FindGroundZ(World, Hologram, Center, Top, Bottom, MaxBuildingZ, OutZ);
-		if (HalfWidth <= 0.0 || Across.IsNearlyZero())
+		OutUnderZ.Reset();
+		bool bFound = false;
+		bool bAnyUnder = false;
+		double UnderZ = 0.0;
+		auto Trace = [&](const FVector2D& XY, double TraceMaxBuildingZ)
 		{
-			return bFound;
-		}
-		for (const double Side : {-HalfWidth, HalfWidth})
-		{
-			double SideZ;
-			if (FindGroundZ(World, Hologram, Center + Across * Side, Top, Bottom, FMath::Min(MaxBuildingZ, SplineZ), SideZ))
+			double TraceZ = 0.0;
+			TOptional<double> TraceUnderZ;
+			if (!FindGroundZ(World, Hologram, XY, Top, Bottom, TraceMaxBuildingZ, TraceZ, SplineZ, &TraceUnderZ))
 			{
-				OutZ = bFound ? FMath::Max(OutZ, SideZ) : SideZ;
-				bFound = true;
+				return;
+			}
+			const double TraceFloorZ = TraceUnderZ.Get(TraceZ);
+			UnderZ = bFound ? FMath::Max(UnderZ, TraceFloorZ) : TraceFloorZ;
+			OutZ = bFound ? FMath::Max(OutZ, TraceZ) : TraceZ;
+			bAnyUnder |= TraceUnderZ.IsSet();
+			bFound = true;
+		};
+		Trace(Center, MaxBuildingZ);
+		if (HalfWidth > 0.0 && !Across.IsNearlyZero())
+		{
+			for (const double Side : {-HalfWidth, HalfWidth})
+			{
+				Trace(Center + Across * Side, FMath::Min(MaxBuildingZ, SplineZ));
 			}
 		}
+		if (bFound && bAnyUnder && UnderZ < OutZ)
+		{
+			OutUnderZ = UnderZ;
+		}
 		return bFound;
+	}
+
+	// A spot along the route: Target is its MinZ (the top surface, plus clearance), UnderZ the
+	// floor under an overhang there (plus clearance), if any.
+	struct FGroundSite
+	{
+		double* Target;
+		TOptional<double> UnderZ;
+	};
+
+	// Sites run along the route from end to end; the ends have no UnderZ. Each stretch of sites
+	// under an overhang passes over it (keeps the tops) or under it (takes the floors) as a whole:
+	// under, unless over climbs clearly less from the sites on either side. Choosing spot by spot
+	// by distance to the route dropped a belt between two points on top of an arch to the sand
+	// under it (the straight line joining them dips below the arch's top), and put a lift in the
+	// middle of a belt running from an arch top down to the ground.
+	void ChooseOverOrUnder(const TArray<FGroundSite>& Sites)
+	{
+		int32 Index = 0;
+		while (Index < Sites.Num())
+		{
+			if (!Sites[Index].UnderZ.IsSet())
+			{
+				++Index;
+				continue;
+			}
+			const int32 First = Index;
+			while (Index < Sites.Num() && Sites[Index].UnderZ.IsSet())
+			{
+				++Index;
+			}
+			const int32 Last = Index - 1;
+			if (First == 0 || Last + 1 >= Sites.Num())
+			{
+				continue; // can't happen: the ends have no UnderZ
+			}
+
+			double OverClimb = 0.0;
+			double UnderClimb = 0.0;
+			double PreviousOver = *Sites[First - 1].Target;
+			double PreviousUnder = PreviousOver;
+			for (int32 Site = First; Site <= Last; ++Site)
+			{
+				const double Over = *Sites[Site].Target;
+				const double Under = *Sites[Site].UnderZ;
+				OverClimb += FMath::Abs(Over - PreviousOver);
+				UnderClimb += FMath::Abs(Under - PreviousUnder);
+				PreviousOver = Over;
+				PreviousUnder = Under;
+			}
+			const double After = *Sites[Last + 1].Target;
+			OverClimb += FMath::Abs(After - PreviousOver);
+			UnderClimb += FMath::Abs(After - PreviousUnder);
+
+			const bool bUnder = UnderClimb <= OverClimb + OverhangClimbTolerance;
+			if (FirstTime(bUnder ? TEXT("ground:overhang-under") : TEXT("ground:overhang-over")))
+			{
+				UE_LOG(LogTerrainBelts, Display, TEXT("Overhang over %d spots: passing %s (climb over %.0f cm, under %.0f cm)"),
+					Last - First + 1, bUnder ? TEXT("under") : TEXT("over"), OverClimb, UnderClimb);
+			}
+			if (bUnder)
+			{
+				for (int32 Site = First; Site <= Last; ++Site)
+				{
+					*Sites[Site].Target = *Sites[Site].UnderZ;
+				}
+			}
+		}
 	}
 
 	FVector2D AcrossDirection(const FVector& Tangent)
@@ -685,17 +875,25 @@ namespace TerrainBelts
 		Out.MinZ.SetNum(Num);
 		Out.MinZ[0] = StartZ;
 		Out.MinZ[Num - 1] = EndZ;
+		TArray<TOptional<double>> PointUnderZ;
+		PointUnderZ.SetNum(Num);
 		for (int32 Index = 1; Index + 1 < Num; ++Index)
 		{
 			const FSplinePointData& Point = Out.Points[Index];
 			const double Bottom = FMath::Min3(StartZ, EndZ, Point.Location.Z) - TraceSearchDistance;
 			double GroundZ;
-			const bool bFound = FindGroundZAcross(World, Hologram, FVector2D(Point.Location), AcrossDirection(Point.LeaveTangent), Settings.HalfWidth, TraceTop(Out.Along[Index]), Bottom, MaxBuildingZ, Point.Location.Z, GroundZ);
+			TOptional<double> UnderZ;
+			const bool bFound = FindGroundZAcross(World, Hologram, FVector2D(Point.Location), AcrossDirection(Point.LeaveTangent), Settings.HalfWidth, TraceTop(Out.Along[Index]), Bottom, MaxBuildingZ, Point.Location.Z, GroundZ, UnderZ);
 			Out.MinZ[Index] = bFound ? GroundZ + Settings.GroundClearance : Point.Location.Z;
+			if (bFound && UnderZ.IsSet())
+			{
+				PointUnderZ[Index] = *UnderZ + Settings.GroundClearance;
+			}
 			Out.bFoundGround |= bFound;
 		}
 
 		Out.Samples.Reset();
+		TArray<TOptional<double>> SampleUnderZ;
 		if (Settings.GroundSampleSpacing > 0.0)
 		{
 			for (int32 Segment = 0; Segment + 1 < Num; ++Segment)
@@ -710,14 +908,30 @@ namespace TerrainBelts
 					const FVector Tangent = FMath::CubicInterpDerivative(A.Location, A.LeaveTangent, B.Location, B.ArriveTangent, T);
 					const double Bottom = FMath::Min3(StartZ, EndZ, Location.Z) - TraceSearchDistance;
 					double GroundZ;
-					if (FindGroundZAcross(World, Hologram, FVector2D(Location), AcrossDirection(Tangent), Settings.HalfWidth, TraceTop(Out.Along[Segment] + T * Out.Step[Segment]), Bottom, MaxBuildingZ, Location.Z, GroundZ))
+					TOptional<double> UnderZ;
+					if (FindGroundZAcross(World, Hologram, FVector2D(Location), AcrossDirection(Tangent), Settings.HalfWidth, TraceTop(Out.Along[Segment] + T * Out.Step[Segment]), Bottom, MaxBuildingZ, Location.Z, GroundZ, UnderZ))
 					{
 						Out.Samples.Add({Segment, T, GroundZ + Settings.GroundClearance});
+						SampleUnderZ.Add(UnderZ.IsSet() ? TOptional<double>(*UnderZ + Settings.GroundClearance) : TOptional<double>());
 						Out.bFoundGround = true;
 					}
 				}
 			}
 		}
+
+		// Every point and sample in order along the route (samples come segment by segment), then
+		// pass over or under each overhang as a whole.
+		TArray<FGroundSite> Sites;
+		int32 SampleIndex = 0;
+		for (int32 Index = 0; Index < Num; ++Index)
+		{
+			Sites.Add({&Out.MinZ[Index], PointUnderZ[Index]});
+			for (; SampleIndex < Out.Samples.Num() && Out.Samples[SampleIndex].Segment == Index; ++SampleIndex)
+			{
+				Sites.Add({&Out.Samples[SampleIndex].MinZ, SampleUnderZ[SampleIndex]});
+			}
+		}
+		ChooseOverOrUnder(Sites);
 		return true;
 	}
 
@@ -894,9 +1108,12 @@ namespace TerrainBelts
 				}
 				return false;
 			}
+			// Clearance is a preference, not a limit: ground the belt can reach only by giving up some
+			// of it still counts, and the belt runs that much closer to it (MaxZ below). Rejecting
+			// those dropped the belt from an auto-lift top across an arch's crown to its end.
 			for (int32 Index = 1; Index + 1 < Num; ++Index)
 			{
-				if (MinZ[Index] > ReachableHeight(Along[Index]))
+				if (MinZ[Index] - Settings.GroundClearance > ReachableHeight(Along[Index]))
 				{
 					if (FirstTime(TEXT("belt:unreachable-ground")))
 					{
@@ -908,7 +1125,7 @@ namespace TerrainBelts
 			}
 			for (const FGroundSample& Sample : Samples)
 			{
-				if (Sample.MinZ > ReachableHeight(Along[Sample.Segment] + Sample.T * Step[Sample.Segment]))
+				if (Sample.MinZ - Settings.GroundClearance > ReachableHeight(Along[Sample.Segment] + Sample.T * Step[Sample.Segment]))
 				{
 					if (FirstTime(TEXT("belt:unreachable-sample")))
 					{
@@ -965,6 +1182,23 @@ namespace TerrainBelts
 			}
 		}
 
+		// A belt can't go higher than it can climb back down from to either end. Without this cap,
+		// sample correction over a short crest raised a point past it, and the result was rejected
+		// as too steep.
+		TArray<FGroundSample> ReachableSamples = Samples;
+		if (Settings.bEnforceIncline)
+		{
+			for (int32 Index = 1; Index + 1 < Num; ++Index)
+			{
+				MaxZ[Index] = FMath::Min(MaxZ[Index], ReachableHeight(Along[Index]) - HeightTolerance);
+				MinZ[Index] = FMath::Min(MinZ[Index], MaxZ[Index]);
+			}
+			for (FGroundSample& Sample : ReachableSamples)
+			{
+				Sample.MinZ = FMath::Min(Sample.MinZ, ReachableHeight(Along[Sample.Segment] + Sample.T * Step[Sample.Segment]) - HeightTolerance);
+			}
+		}
+
 		constexpr int32 MaxSampleRounds = 4;
 		constexpr double SampleTolerance = 2.0;
 		for (int32 Round = 0; Round < MaxSampleRounds; ++Round)
@@ -990,7 +1224,7 @@ namespace TerrainBelts
 			}
 
 			bool bRaised = false;
-			for (const FGroundSample& Sample : Samples)
+			for (const FGroundSample& Sample : ReachableSamples)
 			{
 				const FSplinePointData& A = Points[Sample.Segment];
 				const FSplinePointData& B = Points[Sample.Segment + 1];
@@ -1096,6 +1330,34 @@ namespace TerrainBelts
 		return true;
 	}
 
+	// Whether the vanilla route stays above the ground everywhere, by at most MaxFloat.
+	bool RidesCloseAboveGround(const FGroundProfile& Profile, double MaxFloat)
+	{
+		constexpr double HeightTolerance = 2.0; // cm; allow collision seams
+		auto IsClose = [&](double VanillaZ, double MinZ)
+		{
+			const double Float = VanillaZ - MinZ;
+			return Float >= -HeightTolerance && Float <= MaxFloat;
+		};
+		for (int32 Index = 1; Index + 1 < Profile.MinZ.Num(); ++Index)
+		{
+			if (!IsClose(Profile.Points[Index].Location.Z, Profile.MinZ[Index]))
+			{
+				return false;
+			}
+		}
+		for (const FGroundSample& Sample : Profile.Samples)
+		{
+			const FSplinePointData& A = Profile.Points[Sample.Segment];
+			const FSplinePointData& B = Profile.Points[Sample.Segment + 1];
+			if (!IsClose(FMath::CubicInterp(A.Location.Z, A.LeaveTangent.Z, B.Location.Z, B.ArriveTangent.Z, Sample.T), Sample.MinZ))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
 	// A lift beside a flat approach inherits its support height instead of pulling the belt
 	// down to ground clearance. On uneven ground the foot still follows the terrain.
 	double LiftFootHeight(const FGroundProfile& Profile, int32 Low, bool bUphill)
@@ -1159,6 +1421,14 @@ namespace TerrainBelts
 			if (FirstTime(TEXT("no ground")))
 			{
 				UE_LOG(LogTerrainBelts, Display, TEXT("No ground under the spline; keeping vanilla's shape"));
+			}
+			return true;
+		}
+		if (Settings.MaxKeptFloat > 0.0 && RidesCloseAboveGround(Profile, Settings.MaxKeptFloat))
+		{
+			if (FirstTime(TEXT("close above ground")))
+			{
+				UE_LOG(LogTerrainBelts, Display, TEXT("Spline rides close above the ground; keeping vanilla's shape"));
 			}
 			return true;
 		}
@@ -1769,8 +2039,8 @@ namespace TerrainBelts
 		{
 			const double Default = Tip.Z - Radius;
 			const UWorld* World = Hologram->GetWorld();
-			double GroundAtTip;
-			double GroundAtBendEnd;
+			double GroundAtTip = 0.0;
+			double GroundAtBendEnd = 0.0;
 			// Start below the bend: the end sits inside the floor it hangs from (a pipe floor hole),
 			// and a trace starting there found that floor itself and left no room to drop.
 			const double Top = Tip.Z - Radius;
@@ -3003,6 +3273,7 @@ void FTerrainBeltsModule::RegisterHooks()
 				.GroundSampleSpacing = BeltGroundSampleSpacing,
 				.VerticalBendRadius = BeltVerticalBendRadius,
 				.bKeepLevelOnFlatGround = true,
+				.MaxKeptFloat = BeltMaxKeptFloat,
 				.bEnforceIncline = true});
 			if (ShouldFollowTerrain(Hologram) && ApplyAutoLift(Hologram, Settings))
 			{

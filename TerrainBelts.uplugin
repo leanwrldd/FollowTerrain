@@ -1,8 +1,8 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "1.2.2",
-	"SemVersion": "1.2.2",
+	"VersionName": "1.2.3",
+	"SemVersion": "1.2.3",
 	"GameVersion": ">=491125",
 	"FriendlyName": "Terrain Belts",
 	"Description": "Press Alt + T while placing a conveyor belt, pipe, hypertube or railway track to toggle Follow Terrain: the Default, Straight and Curve build modes then drape over the ground instead of cutting straight through it. The key is rebindable under Options > Controls.",

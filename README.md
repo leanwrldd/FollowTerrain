@@ -61,7 +61,9 @@ something misbehaves for clients, please open an issue.
 
 ## Known limitations
 
-- Under overhangs and in caves the ground check can land on the ceiling.
+- Under overhangs and in caves the line goes under, unless going over climbs clearly less (a belt
+  placed along the top of a rock arch stays on top). It only passes under where there's at least
+  4 m of open space over the floor.
 - On hilly ground, railway tracks can only rise, so they may end up raised well above the ground.
 - Blueprints and the blueprint designer are not supported yet.
 

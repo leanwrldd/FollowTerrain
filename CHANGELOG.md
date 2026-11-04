@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.3
+
+### Fixed
+- Under a rock arch, cave roof or other overhang, Follow Terrain always went over the top, with
+  automatic lifts up and back down, even when both ends were on the open ground underneath. Now
+  each overhang is passed under, with any lifts at either end of it, unless going over climbs
+  clearly less. Passing under needs at least 4 m of open space, and a belt placed along the top
+  of an arch stays on top.
+- A short belt between two machine ports bent down towards uneven ground with Follow Terrain on.
+  A belt that already runs clear of the ground, at most about 2 m above it, now keeps vanilla's
+  straight shape.
+- A belt dragged from the ground onto a rounded top, such as a rock arch, got no automatic lift
+  and was left too steep. Where the belt can't keep its full clearance over a crest, it now runs
+  a little closer to the ground instead of being rejected.
+
 ## 1.2.2
 
 ### Fixed
